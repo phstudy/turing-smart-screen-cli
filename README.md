@@ -8,111 +8,106 @@ This CLI tool allows you to interact with Turing Smart Screen device (VENDOR_ID:
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.7+
 - Dependencies:
   - pyusb
   - pycryptodome
   - Pillow (PIL)
+  - pytest (for testing)
+  - mypy, black, flake8 (for development)
 - FFmpeg (for video processing)
 
 ## Installation
 
 1. Clone this repository:
-```
-git clone https://github.com/phstudy/turing_screen_cli.git
-cd turing_screen_cli
-```
+   ```sh
+   git clone https://github.com/phstudy/turing_screen_cli.git
+   cd turing_screen_cli
+   ```
 
 2. Install the required Python packages:
-```
-pip install -r requirements.txt
-```
+   ```sh
+   pip install -r requirements.txt
+   ```
 
-3. Make sure FFmpeg is installed on your system (required for video functionality).
+3. (Optional, for development) Install in editable mode:
+   ```sh
+   pip install -e .
+   ```
+
+4. Make sure FFmpeg is installed on your system (required for video functionality).
 
 ## Usage
 
-```
-python turing_screen_cli.py [command] [options]
+After installation, you can use the CLI as follows:
+
+```sh
+turing-screen [command] [options]
 ```
 
 ### Available Commands
 
-- **sync**: Send sync command to the device
+#### Image Operations
+- **Display an image on the screen**
+  ```sh
+  turing-screen image /path/to/image.png
   ```
-  python turing_screen_cli.py sync
-  ```
-
-- **restart**: Restart the device
-  ```
-  python turing_screen_cli.py restart
-  ```
-
-- **refresh-storage**: Get storage information
-  ```
-  python turing_screen_cli.py refresh-storage
+- **Clear the current image**
+  ```sh
+  turing-screen image /path/to/image.png --clear
   ```
 
-- **brightness**: Set screen brightness (0-102)
+#### Video Operations
+- **Play a video on the screen**
+  ```sh
+  turing-screen video /path/to/video.mp4
   ```
-  python turing_screen_cli.py brightness --value 50
+- **Loop the video**
+  ```sh
+  turing-screen video /path/to/video.mp4 --loop
   ```
-
-- **save**: Save device settings
-  ```
-  python turing_screen_cli.py save [options]
-  ```
-  Options:
-  - `--brightness [0-102]`: Default 102
-  - `--startup [0|1|2]`: 0 = default, 1 = play image, 2 = play video
-  - `--rotation [0|2]`: 0 = 0°, 2 = 180°
-  - `--sleep [0-255]`: Sleep timeout
-  - `--offline [0|1]`: 0 = Disabled, 1 = Enabled
-
-- **list-storage**: List files stored on the device
-  ```
-  python turing_screen_cli.py list-storage --type [image|video]
-  ```
-  Options:
-  - `--type [image|video]`: Type of files to list
-
-- **clear-image**: Clear the current image
-  ```
-  python turing_screen_cli.py clear-image
+- **Stop video playback**
+  ```sh
+  turing-screen video /path/to/video.mp4 --stop
   ```
 
-- **send-image**: Display an image on the screen
+#### File Operations
+- **Upload a file to device storage**
+  ```sh
+  turing-screen file upload /path/to/file.png
   ```
-  python turing_screen_cli.py send-image --path /path/to/image.png
+- **Delete a file from device storage**
+  ```sh
+  turing-screen file delete filename.png
   ```
-  Note: Images must be exactly 480x1920 pixels in PNG format
-
-- **send-video**: Play a video on the screen
-  ```
-  python turing_screen_cli.py send-video --path /path/to/video.mp4 [--loop]
-  ```
-  Add `--loop` to continuously play the video until interrupted with Ctrl+C
-
-- **upload**: Upload PNG or MP4 file to device storage
-  ```
-  python turing_screen_cli.py upload --path /path/to/file.png
-  ```
-  Note: PNG files will be stored in /tmp/sdcard/mmcblk0p1/img/ and MP4 files will be converted to H264 and stored in /tmp/sdcard/mmcblk0p1/video/
-
-- **delete**: Delete a file from device storage
-  ```
-  python turing_screen_cli.py delete --filename filename.png
+- **List files in device storage**
+  ```sh
+  turing-screen file list /path/on/device
   ```
 
-- **play-select**: Play a stored PNG image or H264 video from device storage
+#### Device Operations
+- **Send sync command**
+  ```sh
+  turing-screen device sync
   ```
-  python turing_screen_cli.py play-select --filename filename.png
+- **Restart the device**
+  ```sh
+  turing-screen device restart
+  ```
+- **Set screen brightness (0-102)**
+  ```sh
+  turing-screen device brightness 50
+  ```
+- **Set frame rate**
+  ```sh
+  turing-screen device frame-rate 30
   ```
 
-- **stop-play**: Stop current playback
-  ```
-  python turing_screen_cli.py stop-play
-  ```
+### Help
+
+```sh
+turing-screen --help
+```
 
 ## Device Storage Structure
 
@@ -128,6 +123,25 @@ The Turing Smart Screen has the following storage structure:
 - Videos:
   - For direct streaming: MP4 format (will be converted to H264)
   - For storage: H264 format
+
+## Development & Testing
+
+- **Run tests:**
+  ```sh
+  pytest
+  ```
+- **Type checking:**
+  ```sh
+  mypy src/turing_screen_cli
+  ```
+- **Code formatting:**
+  ```sh
+  black src/turing_screen_cli
+  ```
+- **Linting:**
+  ```sh
+  flake8 src/turing_screen_cli
+  ```
 
 ## Troubleshooting
 
