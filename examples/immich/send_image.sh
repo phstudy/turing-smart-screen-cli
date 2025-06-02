@@ -27,13 +27,13 @@ SELECTED_PERSON_ID=${IMMICH_PERSON_IDS[$RANDOM_INDEX]}
 HOUR=$(date +%H)
 DAY=$(date +%u)  # 1-7, where 1 is Monday
 
-# Monday-Friday 17-22
-if [ $DAY -le 5 ] && [ $HOUR -ge 17 ] && [ $HOUR -le 22 ]; then
+# Monday-Friday 17-21
+if [ $DAY -le 5 ] && [ $HOUR -ge 17 ] && [ $HOUR -le 21 ]; then
     python ../../turing_screen_cli.py brightness --value 50
     python immich_photo_display.py --token $IMMICH_TOKEN --output /tmp --person-id $SELECTED_PERSON_ID
     python ../../turing_screen_cli.py send-image --path /tmp/random.png
-# Saturday-Sunday 7-22
-elif [ $DAY -ge 6 ] && [ $HOUR -ge 7 ] && [ $HOUR -le 22 ]; then
+# Saturday-Sunday 7-21
+elif [ $DAY -ge 6 ] && [ $HOUR -ge 7 ] && [ $HOUR -le 21 ]; then
     python ../../turing_screen_cli.py brightness --value 50
     python immich_photo_display.py --token $IMMICH_TOKEN --output /tmp --person-id $SELECTED_PERSON_ID
     python ../../turing_screen_cli.py send-image --path /tmp/random.png
