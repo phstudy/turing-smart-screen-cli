@@ -77,9 +77,9 @@ def get_person_bbox_alternative(asset_id: str, person_id: str, token: str, api_u
 
 def crop_around_person(image: Image.Image, bbox: dict, target_width=1920, target_height=480) -> Image.Image:
     width, height = image.size
-    print(f"DEBUG: Forcing landscape crop 1920x480, original image size: {width}x{height}")
+    print(f"DEBUG: Processing face-based crop, original image size: {width}x{height}")
     
-    # Handle absolute vs relative coordinates
+    # Step 1: Get face coordinates
     if bbox.get("absolute", False):
         x1, y1, x2, y2 = bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]
     else:
@@ -88,34 +88,54 @@ def crop_around_person(image: Image.Image, bbox: dict, target_width=1920, target
         x2 = int(bbox["x2"] * width)
         y2 = int(bbox["y2"] * height)
     
-    # Calculate height based on face detection, but cap at target_height
     face_height = y2 - y1
-    crop_height = min(max(face_height, target_height), target_height)
+    face_center_x = (x1 + x2) // 2
+    face_center_y = (y1 + y2) // 2
+    print(f"DEBUG: Face bbox: ({x1}, {y1}, {x2}, {y2})")
+    print(f"DEBUG: Face height: {face_height}, Face center: ({face_center_x}, {face_center_y})")
     
-    person_center_x = (x1 + x2) // 2
-    person_center_y = (y1 + y2) // 2
-    print(f"DEBUG: Person center at ({person_center_x}, {person_center_y})")
+    # Step 2: Crop from original image - face height with balanced left/right, centered on face
+    crop_top = max(0, face_center_y - face_height // 2)
+    crop_bottom = min(height, crop_top + face_height)
+    # Adjust if we can't get full face height
+    crop_top = max(0, crop_bottom - face_height)
     
-    # Crop with calculated height
-    crop_width = target_width
-    left = max(0, person_center_x - crop_width // 2)
-    top = max(0, person_center_y - crop_height // 2)
-    right = min(left + crop_width, width)
-    bottom = min(top + crop_height, height)
+    # Calculate left/right crop to center the face - use longer distance but stay within bounds
+    left_distance = face_center_x  # Distance from face center to left edge
+    right_distance = width - face_center_x  # Distance from face center to right edge
+    half_width = max(left_distance, right_distance)  # Use the longer distance
     
-    # Adjust if we can't get full width
-    if right - left < crop_width:
-        left = max(0, right - crop_width)
+    # Calculate crop boundaries within image bounds
+    crop_left = max(0, face_center_x - half_width)
+    crop_right = min(width, face_center_x + half_width)
     
-    print(f"DEBUG: Cropping ({left}, {top}, {right}, {bottom})")
-    cropped = image.crop((left, top, right, bottom))
+    cropped_region = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+    crop_width, crop_height = cropped_region.size
+    print(f"DEBUG: Cropped region: {crop_width}x{crop_height}")
     
-    # Create new image with target dimensions and black background
-    result = Image.new('RGBA', (crop_width, crop_height), (0, 0, 0, 255))
-    crop_w, crop_h = cropped.size
-    paste_x = (crop_width - crop_w) // 2
-    paste_y = (crop_height - crop_h) // 2
-    result.paste(cropped, (paste_x, paste_y))
+    # Step 3: Scale to height 480px
+    scale_factor = target_height / crop_height
+    new_width = int(crop_width * scale_factor)
+    new_height = target_height
+    
+    scaled_image = cropped_region.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    print(f"DEBUG: Scaled to: {new_width}x{new_height}")
+    
+    # Handle width constraints
+    if new_width > target_width:
+        # Calculate where face center would be in scaled image
+        scaled_face_center_x = int((face_center_x - crop_left) * scale_factor)
+        
+        # Center crop around face center
+        crop_start_x = max(0, min(scaled_face_center_x - target_width // 2, new_width - target_width))
+        result = scaled_image.crop((crop_start_x, 0, crop_start_x + target_width, new_height))
+        print(f"DEBUG: Face-centered crop to {target_width}x{new_height}, face center at {scaled_face_center_x}")
+    else:
+        # Pad with black
+        result = Image.new('RGBA', (target_width, target_height), (0, 0, 0, 255))
+        paste_x = (target_width - new_width) // 2
+        result.paste(scaled_image, (paste_x, 0))
+        print(f"DEBUG: Padded to {target_width}x{target_height}")
     
     # Rotate to portrait before returning
     result = result.rotate(270, expand=True)
