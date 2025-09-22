@@ -8,7 +8,7 @@ This CLI tool allows you to interact with Turing Smart Screen device (VENDOR_ID:
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.8+
 - Dependencies:
   - pyusb
   - pycryptodome
