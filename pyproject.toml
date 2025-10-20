@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turingscreencli"
+version = "0.1.0"
+description = "CLI utilities for the Turing Smart Screen 8.8\" V1.1 device."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [{name = "Study Hsueh"}]
+keywords = ["turing", "smart-screen", "lcd", "usb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Hardware :: Universal Serial Bus (USB)",
+]
+dependencies = [
+    "pyusb>=1.2.1",
+    "pycryptodome>=3.15.0",
+    "Pillow>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    "black>=22.0.0",
+    "flake8>=6.0.0",
+    "ruff>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/phstudy/turing-smart-screen-cli"
+Issues = "https://github.com/phstudy/turing-smart-screen-cli/issues"
+
+[project.scripts]
+turing-screen = "turingscreencli.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.black]
+target-version = ["py39"]
+line-length = 120
+
+[tool.flake8]
+max-line-length = 120
+extend-ignore = ["E203"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["turingscreencli", "turingscreencli.*"]

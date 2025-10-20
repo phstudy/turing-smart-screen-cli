@@ -1,152 +1,107 @@
 # Turing Smart Screen CLI
 
-A command-line interface tool for controlling Turing Smart Screen 8.8 inch V1.1 device via USB.
+Warning: This is an unofficial implementation; use at your own risk.
 
 ## Overview
 
-This CLI tool allows you to interact with Turing Smart Screen device (VENDOR_ID: 0x1cbe, PRODUCT_ID: 0x0088) from your computer. You can send various commands including displaying images, playing videos, adjusting brightness, and configuring device settings.
+Turing Smart Screen CLI provides command-line utilities for managing the Turing Smart Screen 8.8" V1.1 USB display. All operations run on-demand—no background daemon is left running—and lower level USB/HID errors are surfaced directly to aid scripting.
 
-## Requirements
+## Supported Hardware
 
-- Python 3.8+
-- Dependencies:
-  - pyusb
-  - pycryptodome
-  - Pillow (PIL)
-  - pytest (for testing)
-  - mypy, black, flake8 (for development)
-- FFmpeg (for video processing)
+- Turing Smart Screen 8.8" V1.1 (USB VID 0x1CBE, PID 0x0088)
+
+## Features
+
+- Send sync, restart, and configuration commands to the device.
+- Adjust brightness, frame rate, and persist settings to flash.
+- Upload PNG/H264 assets to on-device storage and list or delete them.
+- Stream PNG frames directly to the panel or play MP4 videos via FFmpeg conversion.
+- Trigger playback of stored PNG or H264 assets and stop active playback.
 
 ## Installation
 
-1. Clone this repository:
-   ```sh
-   git clone https://github.com/phstudy/turing_screen_cli.git
-   cd turing_screen_cli
-   ```
+```bash
+pip install turingscreencli
 
-2. Install the required Python packages:
-   ```sh
-   pip install -r requirements.txt
-   ```
-
-3. (Optional, for development) Install in editable mode:
-   ```sh
-   pip install -e .
-   ```
-
-4. Make sure FFmpeg is installed on your system (required for video functionality).
-
-## Usage
-
-After installation, you can use the CLI as follows:
-
-```sh
-turing-screen [command] [options]
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+# or grab tooling extras
+pip install -e .[dev]
 ```
 
-### Available Commands
+On macOS/Linux you may need to install FFmpeg separately (e.g., `brew install ffmpeg`).
 
-#### Image Operations
-- **Display an image on the screen**
-  ```sh
-  turing-screen image /path/to/image.png
-  ```
-- **Clear the current image**
-  ```sh
-  turing-screen image /path/to/image.png --clear
-  ```
+## Usage Examples
 
-#### Video Operations
-- **Play a video on the screen**
-  ```sh
-  turing-screen video /path/to/video.mp4
-  ```
-- **Loop the video**
-  ```sh
-  turing-screen video /path/to/video.mp4 --loop
-  ```
-- **Stop video playback**
-  ```sh
-  turing-screen video /path/to/video.mp4 --stop
-  ```
+```bash
+# Enumerate and sanity check device connectivity
+turing-screen sync
 
-#### File Operations
-- **Upload a file to device storage**
-  ```sh
-  turing-screen file upload /path/to/file.png
-  ```
-- **Delete a file from device storage**
-  ```sh
-  turing-screen file delete filename.png
-  ```
-- **List files in device storage**
-  ```sh
-  turing-screen file list /path/on/device
-  ```
+# Adjust device state
+turing-screen brightness --value 64
+turing-screen save --brightness 96 --rotation 2
 
-#### Device Operations
-- **Send sync command**
-  ```sh
-  turing-screen device sync
-  ```
-- **Restart the device**
-  ```sh
-  turing-screen device restart
-  ```
-- **Set screen brightness (0-102)**
-  ```sh
-  turing-screen device brightness 50
-  ```
-- **Set frame rate**
-  ```sh
-  turing-screen device frame-rate 30
-  ```
+# Send media directly to the panel
+turing-screen send-image --path assets/sample.png
+turing-screen send-video --path demo.mp4 --loop
 
-### Help
-
-```sh
-turing-screen --help
+# Work with on-device storage
+turing-screen refresh-storage
+turing-screen upload --path demo.png
+turing-screen list-storage --type image
+turing-screen delete --filename demo.png
+turing-screen play-select --filename demo.png
+turing-screen stop-play
 ```
 
-## Device Storage Structure
+Installing the package provides a `turing-screen` console script.
 
-The Turing Smart Screen has the following storage structure:
-- Images are stored in: `/tmp/sdcard/mmcblk0p1/img/`
-- Videos are stored in: `/tmp/sdcard/mmcblk0p1/video/`
+## Command Summary
 
-## Image and Video Requirements
-
-- Images:
-  - Format: PNG only
-  - Resolution: 480x1920 pixels
-- Videos:
-  - For direct streaming: MP4 format (will be converted to H264)
-  - For storage: H264 format
+- `sync` – Ping the panel to keep it responsive.
+- `restart` – Reboot the panel.
+- `refresh-storage` – Display SD card usage statistics.
+- `clear-image` – Push a transparent frame to clear the panel.
+- `stop-play` – Stop any active playback.
+- `brightness --value` – Set LCD brightness.
+- `save` – Persist brightness/startup/rotation/offline settings.
+- `list-storage --type image|video` – List files on the device.
+- `send-image --path` – Stream a PNG to the screen.
+- `send-video --path [--loop]` – Stream MP4/H264 video.
+- `upload --path` – Upload PNG/MP4 assets to storage.
+- `delete --filename` – Delete PNG/H264 assets.
+- `play-select --filename` – Play a stored PNG/H264 asset.
 
 ## Development & Testing
 
-- **Run tests:**
-  ```sh
-  pytest
-  ```
-- **Type checking:**
-  ```sh
-  mypy src/turing_screen_cli
-  ```
-- **Code formatting:**
-  ```sh
-  black src/turing_screen_cli
-  ```
-- **Linting:**
-  ```sh
-  flake8 src/turing_screen_cli
-  ```
+Install the dev extras and run the automated checks before submitting changes:
+
+```bash
+pip install -e .[dev]
+python -m compileall src
+python -m pytest
+python -m pytest --cov=turingscreencli
+python -m ruff check src tests  # if you have ruff installed
+black src tests
+flake8 src tests
+mypy src
+```
+
+Tests under `tests/` rely on pytest and exercise CLI argument parsing and dispatch logic with USB communication stubbed out.
 
 ## Troubleshooting
 
-- If you get "USB device not found" error, make sure the device is properly connected
-- For permission issues on Linux, try running with sudo or configure udev rules
-  - Linux users may need to detach the kernel driver using `dev.detach_kernel_driver(0)`
-- Make sure FFmpeg is installed and in your system PATH for video functionality
-- For video playback issues, ensure the video has been properly converted to H264 format
+- "USB device not found" – confirm the panel is connected and powered. On Linux detach the kernel driver with `dev.detach_kernel_driver(0)` or configure udev rules.
+- Permission errors on Linux – create matching udev rules granting access to VID 0x1CBE/PID 0x0088 or run the CLI with elevated privileges.
+- FFmpeg not found – ensure FFmpeg is installed and on your `PATH` for video encoding.
+- Playback glitches – verify assets meet the device requirements (PNG 480×1920, H264 video when stored on the device).
+
+## Device Storage Structure
+
+- Images: `/tmp/sdcard/mmcblk0p1/img/`
+- Videos: `/tmp/sdcard/mmcblk0p1/video/`
+
+## License
+
+Released under the MIT License. See `LICENSE` for details.

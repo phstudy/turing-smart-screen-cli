@@ -38,7 +38,7 @@ The script will:
 ## Requirements
 
 - Python 3.x
-- `turing_screen_cli` package
+- `turing-screen` CLI available (`pip install -e .` from the project root)
 - Immich server access
 - Bash shell
 
