@@ -116,20 +116,20 @@ def play_file3(dev, filename: str) -> bool:
 
 
 def upload_file(dev, file_path: str) -> bool:
-    path_obj = Path(file_path)
-    if not path_obj.exists():
+    local_path = Path(file_path)
+    if not local_path.exists():
         logger.error("Error: File does not exist: %s", file_path)
         return False
 
-    ext = path_obj.suffix.lower()
+    ext = local_path.suffix.lower()
     if ext == ".png":
-        device_path = f"/tmp/sdcard/mmcblk0p1/img/{path_obj.name}"
+        device_path = f"/tmp/sdcard/mmcblk0p1/img/{local_path.name}"
         logger.info("Uploading PNG: %s → %s", file_path, device_path)
     elif ext == ".mp4":
         h264_path = extract_h264_from_mp4(file_path)
         device_path = f"/tmp/sdcard/mmcblk0p1/video/{h264_path.name}"
-        file_path = h264_path  # Update local path to .h264
-        logger.info("Uploading MP4 as H264: %s → %s", file_path, device_path)
+        local_path = h264_path  # Update local path to .h264
+        logger.info("Uploading MP4 as H264: %s → %s", local_path, device_path)
     else:
         logger.error("Error: Unsupported file type. Only .png and .mp4 are allowed.")
         return False
@@ -138,7 +138,7 @@ def upload_file(dev, file_path: str) -> bool:
         logger.error("Failed to open remote file for writing.")
         return False
 
-    if not _write_file_command(dev, str(file_path)):
+    if not _write_file_command(dev, str(local_path)):
         logger.error("Failed to write file data.")
         return False
 

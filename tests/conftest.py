@@ -1,44 +1,44 @@
+import importlib.util
 import sys
 import types
 
 
 def _ensure_pyusb() -> None:
-    try:
-        import usb.core  # type: ignore
-        import usb.util  # type: ignore
-    except ModuleNotFoundError:
-        usb_module = types.ModuleType("usb")
-        core_module = types.ModuleType("usb.core")
-        util_module = types.ModuleType("usb.util")
+    if importlib.util.find_spec("usb.core") and importlib.util.find_spec("usb.util"):
+        return
 
-        class USBError(Exception):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args)
-                self.errno = kwargs.get("errno")
+    usb_module = types.ModuleType("usb")
+    core_module = types.ModuleType("usb.core")
+    util_module = types.ModuleType("usb.util")
 
-        def find(**kwargs):
-            return None
+    class USBError(Exception):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+            self.errno = kwargs.get("errno")
 
-        def find_descriptor(*args, **kwargs):
-            return None
+    def find(**kwargs):
+        return None
 
-        def endpoint_direction(address: int) -> int:
-            return address
+    def find_descriptor(*args, **kwargs):
+        return None
 
-        core_module.USBError = USBError
-        core_module.find = find
+    def endpoint_direction(address: int) -> int:
+        return address
 
-        util_module.find_descriptor = find_descriptor
-        util_module.endpoint_direction = endpoint_direction
-        util_module.ENDPOINT_OUT = 0
-        util_module.ENDPOINT_IN = 0
+    core_module.USBError = USBError
+    core_module.find = find
 
-        usb_module.core = core_module
-        usb_module.util = util_module
+    util_module.find_descriptor = find_descriptor
+    util_module.endpoint_direction = endpoint_direction
+    util_module.ENDPOINT_OUT = 0
+    util_module.ENDPOINT_IN = 0
 
-        sys.modules.setdefault("usb", usb_module)
-        sys.modules.setdefault("usb.core", core_module)
-        sys.modules.setdefault("usb.util", util_module)
+    usb_module.core = core_module
+    usb_module.util = util_module
+
+    sys.modules.setdefault("usb", usb_module)
+    sys.modules.setdefault("usb.core", core_module)
+    sys.modules.setdefault("usb.util", util_module)
 
 
 def _ensure_crypto() -> None:

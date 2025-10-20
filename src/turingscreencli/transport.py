@@ -6,6 +6,7 @@ import logging
 import platform
 import struct
 import time
+from functools import partial
 
 import usb.core
 import usb.util
@@ -18,15 +19,17 @@ PRODUCT_ID = 0x0088
 _DES_KEY = b"slv3tuzx"
 
 
+def _endpoint_matches_direction(endpoint, *, direction):
+    return usb.util.endpoint_direction(endpoint.bEndpointAddress) == direction
+
+
 def build_command_packet_header(command_id: int) -> bytearray:
     """Build a command packet header for the provided command id."""
     packet = bytearray(500)
     packet[0] = command_id
     packet[2] = 0x1A
     packet[3] = 0x6D
-    timestamp = int(
-        (time.time() - time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))) * 1000
-    )
+    timestamp = int((time.time() - time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))) * 1000)
     packet[4:8] = struct.pack("<I", timestamp)
     return packet
 
@@ -85,13 +88,17 @@ def write_to_device(dev, data, timeout: int = 2000):
 
     ep_out = usb.util.find_descriptor(
         intf,
-        custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-        == usb.util.ENDPOINT_OUT,
+        custom_match=partial(
+            _endpoint_matches_direction,
+            direction=usb.util.ENDPOINT_OUT,
+        ),
     )
     ep_in = usb.util.find_descriptor(
         intf,
-        custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-        == usb.util.ENDPOINT_IN,
+        custom_match=partial(
+            _endpoint_matches_direction,
+            direction=usb.util.ENDPOINT_IN,
+        ),
     )
     if ep_out is None or ep_in is None:
         raise RuntimeError("Unable to locate USB endpoints")
