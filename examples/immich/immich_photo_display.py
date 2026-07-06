@@ -61,13 +61,18 @@ def get_person_bbox_alternative(asset_id: str, person_id: str, token: str, api_u
         if isinstance(faces_data, list):
             for face in faces_data:
                 if face.get("person", {}).get("id") == person_id:
-                    bbox = face.get("boundingBox")
-                    if bbox:
+                    # Immich v2/v3 returns flat boundingBox* fields (plus the
+                    # imageWidth/imageHeight the ML detection ran against),
+                    # not a nested "boundingBox" object like older releases.
+                    coord_keys = ("boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2")
+                    if all(key in face for key in coord_keys):
                         return {
-                            "x1": bbox["x1"],
-                            "y1": bbox["y1"], 
-                            "x2": bbox["x2"],
-                            "y2": bbox["y2"]
+                            "x1": face["boundingBoxX1"],
+                            "y1": face["boundingBoxY1"],
+                            "x2": face["boundingBoxX2"],
+                            "y2": face["boundingBoxY2"],
+                            "absolute": True,  # coordinates are in face_data's image space
+                            "face_data": face,  # carries imageWidth/imageHeight for scaling
                         }
     except Exception as e:
         print(f"DEBUG: Faces endpoint failed: {e}")
@@ -161,24 +166,60 @@ def center_crop(image: Image.Image, target_width=1920, target_height=480) -> Ima
     paste_x = (crop_width - crop_w) // 2
     paste_y = (crop_height - crop_h) // 2
     result.paste(cropped, (paste_x, paste_y))
-    # Rotate to portrait before returning
-    result = result.rotate(90, expand=True)
+    # Rotate to portrait before returning. Must match crop_around_person's
+    # rotation direction (270) so the fallback path is never upside-down.
+    result = result.rotate(270, expand=True)
     return result
 
 
-def fetch_random_asset_for_person(person_id: str, token: str, api_url: str = None):
+def fetch_random_asset_for_person(
+    person_id: str,
+    token: str,
+    api_url: str = None,
+    taken_after: str = None,
+    taken_before: str = None,
+):
     url = f"{api_url}/search/metadata"
     headers = {
         "Content-Type": "application/json",
         "x-api-key": token
     }
-    payload = {"personIds": [person_id], "size": 1000}
-    resp = requests.post(url, headers=headers, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    assets = data.get("assets").get("items", [])
 
-    asset_ids = [asset['id'] for asset in assets if 'id' in asset]
+    # Optional date-range filter. Immich's /search/metadata requires a full
+    # ISO-8601 timestamp (a bare "2020-01-01" is rejected with HTTP 400), so
+    # expand plain YYYY-MM-DD dates: start-of-day for takenAfter, end-of-day
+    # for takenBefore.
+    def _to_iso(value: str, end_of_day: bool) -> str:
+        if len(value) == 10 and "T" not in value:  # YYYY-MM-DD
+            return value + ("T23:59:59.999Z" if end_of_day else "T00:00:00.000Z")
+        return value
+
+    date_filter = {}
+    if taken_after:
+        date_filter["takenAfter"] = _to_iso(taken_after, end_of_day=False)
+    if taken_before:
+        date_filter["takenBefore"] = _to_iso(taken_before, end_of_day=True)
+    if date_filter:
+        print(f"DEBUG: Date range filter: {date_filter}")
+
+    # /search/metadata is paginated (max 1000 per page, newest first). Walk every
+    # page so the random pick covers the whole (filtered) range, not just the most
+    # recent ~1000 photos. Following nextPage keeps older years in the pool.
+    asset_ids = []
+    page = 1
+    while True:
+        payload = {"personIds": [person_id], "size": 1000, "page": page, **date_filter}
+        resp = requests.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        assets = resp.json().get("assets", {})
+        asset_ids.extend(asset["id"] for asset in assets.get("items", []) if "id" in asset)
+
+        next_page = assets.get("nextPage")
+        if not next_page:
+            break
+        page = int(next_page)
+
+    print(f"DEBUG: Candidate pool size: {len(asset_ids)} photos across all pages")
     return random.choice(asset_ids) if asset_ids else None
 
 
@@ -305,11 +346,19 @@ def download_and_crop(asset_id: str, person_id: str, token: str, output_path: st
     cropped.save(output_path)
 
 
-def process_person(person_id: str, token: str, output_dir: str, debug: bool = False, api_url: str = None):
+def process_person(
+    person_id: str,
+    token: str,
+    output_dir: str,
+    debug: bool = False,
+    api_url: str = None,
+    taken_after: str = None,
+    taken_before: str = None,
+):
     os.makedirs(output_dir, exist_ok=True)
-    print(f"Processing person: {person_id}")   
-   
-    asset_id = fetch_random_asset_for_person(person_id, token, api_url)
+    print(f"Processing person: {person_id}")
+
+    asset_id = fetch_random_asset_for_person(person_id, token, api_url, taken_after, taken_before)
     if not asset_id:
         print("No assets found for person.")
         return
@@ -329,9 +378,21 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Save original and face detection images")
     parser.add_argument("--api-url", default="http://100.71.170.123:2283/api", help="Immich API URL")
     parser.add_argument("--person-id", required=True, help="Person ID to fetch photos for")
+    parser.add_argument("--taken-after", default=None,
+                        help="Only pick photos taken on/after this date (ISO-8601, e.g. 2020-01-01)")
+    parser.add_argument("--taken-before", default=None,
+                        help="Only pick photos taken on/before this date (ISO-8601, e.g. 2021-12-31)")
     args = parser.parse_args()
 
-    process_person(args.person_id, args.token, os.path.join(args.output), args.debug, args.api_url)
+    process_person(
+        args.person_id,
+        args.token,
+        os.path.join(args.output),
+        args.debug,
+        args.api_url,
+        args.taken_after,
+        args.taken_before,
+    )
 
 
 if __name__ == "__main__":
