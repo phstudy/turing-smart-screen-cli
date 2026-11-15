@@ -136,7 +136,9 @@ def test_one_byte_commands(panel, call, code, byte8):
 
 
 def test_save_settings_layout(panel):
-    operations.send_save_settings_command(None, brightness=90, startup=1, rotation=2, sleep=30, offline=1, clock_direction=3)
+    operations.send_save_settings_command(
+        None, brightness=90, startup=1, rotation=2, sleep=30, offline=1, clock_direction=3
+    )
     (h,) = panel.headers()
     assert h[0] == 125 and list(h[8:15]) == [90, 1, 0, 2, 30, 1, 3]
 
@@ -342,7 +344,7 @@ def test_list_empty_directory(panel):
 
 
 def test_list_no_data_is_an_error_not_truncation(panel, monkeypatch, caplog):
-    clock = iter(range(0, 1000))
+    clock = iter(range(1000))
     monkeypatch.setattr(operations.time, "monotonic", lambda: next(clock))
     panel.replies = [bytes(512)] * 100
     assert operations.send_list_storage_command(None, "/x/", timeout=5) is None
@@ -434,10 +436,15 @@ def test_play_stored_image_write_failure_is_an_error(panel, monkeypatch):
 
 
 def _png(tmp_path, size=(480, 1920), noise=False, name="pic.png"):
-    from PIL import Image
     import os
 
-    img = Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3)) if noise else Image.new("RGB", size, (10, 20, 30))
+    from PIL import Image
+
+    img = (
+        Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3))
+        if noise
+        else Image.new("RGB", size, (10, 20, 30))
+    )
     p = tmp_path / name
     img.save(p)
     return p

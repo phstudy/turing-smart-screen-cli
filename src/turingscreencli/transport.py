@@ -35,7 +35,7 @@ def build_command_packet_header(command_id: int) -> bytearray:
     return packet
 
 
-def encrypt_with_des(key: bytes, data: "bytes | bytearray") -> bytes:
+def encrypt_with_des(key: bytes, data: bytes | bytearray) -> bytes:
     """DES-CBC with IV = key and PKCS7 padding, as .NET's DESCryptoServiceProvider in the vendor app
     (a 500-byte header becomes 504 bytes ending 04 04 04 04)."""
     cipher = DES.new(key, DES.MODE_CBC, key)

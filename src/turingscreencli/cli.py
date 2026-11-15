@@ -55,7 +55,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Send a command even if this panel's firmware is known not to support it (also accepted after the command)",
+        help="Send a command even if this firmware is known not to support it (also accepted after the command)",
     )
     parser.add_argument(
         "-v",
@@ -83,7 +83,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--value",
         type=int,
         required=True,
-        choices=range(0, 101),
+        choices=range(101),
         metavar="[0-100]",
         help="Brightness value (0–100)",
     )
@@ -105,7 +105,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--brightness",
         type=int,
         default=100,
-        choices=range(0, 101),
+        choices=range(101),
         metavar="[0-100]",
         help="Brightness value (0-100, default: 100)",
     )
@@ -137,7 +137,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--sleep",
         type=int,
         default=0,
-        choices=range(0, 256),
+        choices=range(256),
         metavar="[0-255]",
         help="Sleep timeout (default: 0)",
     )
@@ -145,7 +145,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--clock-direction",
         type=int,
         default=0,
-        choices=range(0, 4),
+        choices=range(4),
         metavar="[0-3]",
         help="Offline clock direction (the vendor app sends it; default: 0)",
     )
@@ -159,30 +159,49 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     rotate_parser = subparsers.add_parser("rotate", help="Set the panel rotation (13); the panel saves it")
-    rotate_parser.add_argument("--value", type=int, required=True, choices=[0, 2], metavar="[0|2]", help="0 or 2 (180°)")
+    rotate_parser.add_argument(
+        "--value", type=int, required=True, choices=[0, 2], metavar="[0|2]", help="0 or 2 (180°)"
+    )
 
     size_parser = subparsers.add_parser("file-size", help="Size in bytes of a stored file (0 if missing)")
     size_parser.add_argument("--filename", required=True, help=".png or .h264 filename")
 
     # Commands gated on firmware (operations.FIRMWARE_FEATURES) also take --force after the command.
     force_parent = argparse.ArgumentParser(add_help=False)
-    force_parent.add_argument("--force", action="store_true", default=argparse.SUPPRESS,
-                              help="Send it even if this firmware is known not to support it")
+    force_parent.add_argument(
+        "--force",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Send it even if this firmware is known not to support it",
+    )
 
     subparsers.add_parser("voltage", parents=[force_parent], help="Supply voltage in mV (50)")
     subparsers.add_parser("orientation", parents=[force_parent], help="Orientation sensor reading (60)")
-    subparsers.add_parser("block-size", parents=[force_parent],
-                          help="Stream block size the panel asks for (17; 0 = default 202752)")
+    subparsers.add_parser(
+        "block-size", parents=[force_parent], help="Stream block size the panel asks for (17; 0 = default 202752)"
+    )
 
-    clock_parser = subparsers.add_parser("set-clock", parents=[force_parent],
-                                         help="Set the panel clock (51; the vendor app does this for the 4.6\" only)")
-    clock_parser.add_argument("--time", type=datetime.datetime.fromisoformat, metavar="ISO",
-                              help="Local time, e.g. 2026-11-16T02:05:00 (default: now)")
-    clock_parser.add_argument("--mode", type=int, default=0, choices=[0, 1, 2], metavar="[0|1|2]",
-                              help="Mode byte the vendor app sends (0, 1 or 2; meaning not decoded; default 0)")
+    clock_parser = subparsers.add_parser(
+        "set-clock", parents=[force_parent], help='Set the panel clock (51; the vendor app does this for the 4.6" only)'
+    )
+    clock_parser.add_argument(
+        "--time",
+        type=datetime.datetime.fromisoformat,
+        metavar="ISO",
+        help="Local time, e.g. 2026-11-16T02:05:00 (default: now)",
+    )
+    clock_parser.add_argument(
+        "--mode",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        metavar="[0|1|2]",
+        help="Mode byte the vendor app sends (0, 1 or 2; meaning not decoded; default 0)",
+    )
 
-    run_parser = subparsers.add_parser("run-state", parents=[force_parent],
-                                       help="The vendor app's Run all / Stop all flag (49)")
+    run_parser = subparsers.add_parser(
+        "run-state", parents=[force_parent], help="The vendor app's Run all / Stop all flag (49)"
+    )
     run_parser.add_argument("state", choices=["on", "off"])
 
     off_parser = subparsers.add_parser("power-off", help="Halt the panel until its power is cycled (12)")
@@ -212,8 +231,12 @@ def create_parser() -> argparse.ArgumentParser:
         "auto (PNG if it fits one push, else JPEG)",
     )
     image_parser.add_argument(
-        "--quality", type=int, default=90, choices=range(10, 101), metavar="[10-100]",
-        help="JPEG quality (jpeg/auto only; lowered further if needed to fit 1 MB; default 90)"
+        "--quality",
+        type=int,
+        default=90,
+        choices=range(10, 101),
+        metavar="[10-100]",
+        help="JPEG quality (jpeg/auto only; lowered further if needed to fit 1 MB; default 90)",
     )
 
     parser_video = subparsers.add_parser("send-video", help="Play a video on the screen")
@@ -279,7 +302,7 @@ def _add_brightness_option(subparser) -> None:
         "--brightness",
         type=int,
         default=None,
-        choices=range(0, 101),
+        choices=range(101),
         metavar="[0-100]",
         help="Also set the brightness (default: leave it as it is)",
     )
@@ -301,7 +324,7 @@ def run(argv=None, *, device_factory=transport.find_usb_device) -> int:
     except KeyboardInterrupt:
         logger.warning("Interrupted")
         return 130
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - top level: any failure becomes a message and exit 1
         logger.error("Unexpected error: %s", exc)
         return 1
 
@@ -310,7 +333,7 @@ def run(argv=None, *, device_factory=transport.find_usb_device) -> int:
     except KeyboardInterrupt:
         logger.warning("Interrupted")
         return 130
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - top level: any failure becomes a message and exit 1
         logger.error("Unexpected error: %s", exc)
         return 1
 
@@ -431,7 +454,9 @@ def _dispatch_command(dev, args) -> bool:
     if sync_first:
         operations.delay_sync(dev)
     if feature is not None and not args.force and not operations.supports(dev, feature):
-        logger.error("%s: %s. Add --force to send it anyway.", args.command, operations.unsupported_reason(dev, feature))
+        logger.error(
+            "%s: %s. Add --force to send it anyway.", args.command, operations.unsupported_reason(dev, feature)
+        )
         return False
     return bool(handler(dev, args))
 

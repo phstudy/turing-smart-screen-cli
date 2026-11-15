@@ -3,8 +3,7 @@ import json
 
 import pytest
 
-import turingscreencli.cli as cli
-from turingscreencli import transport
+from turingscreencli import cli, transport
 
 
 def _noop(*_args, **_kwargs):
@@ -38,22 +37,42 @@ CASES = {
         b"ok",
         lambda c: c[1]["brightness"] == 50 and c[1]["rotation"] == 2 and c[1]["clock_direction"] == 1,
     ),
-    "list-storage": (["list-storage", "--type", "video"], "send_list_storage_command", ["a.h264"],
-                     lambda c: c[0][1] == cli.operations.VIDEO_DIR),
+    "list-storage": (
+        ["list-storage", "--type", "video"],
+        "send_list_storage_command",
+        ["a.h264"],
+        lambda c: c[0][1] == cli.operations.VIDEO_DIR,
+    ),
     "file-size": (["file-size", "--filename", "a.png"], "file_size", 12, lambda c: c[0][1] == "a.png"),
-    "send-image": (["send-image", "--path", "a.png", "--format", "jpeg", "--quality", "70"], "send_image", True,
-                   lambda c: c[1]["fmt"] == "jpeg" and c[1]["quality"] == 70),
-    "send-video": (["send-video", "--path", "a.mp4", "--frame-rate", "24", "--rotation", "2"], "send_video", True,
-                   lambda c: c[1]["frame_rate"] == 24 and c[1]["rotation"] == 2 and c[1]["brightness"] is None),
+    "send-image": (
+        ["send-image", "--path", "a.png", "--format", "jpeg", "--quality", "70"],
+        "send_image",
+        True,
+        lambda c: c[1]["fmt"] == "jpeg" and c[1]["quality"] == 70,
+    ),
+    "send-video": (
+        ["send-video", "--path", "a.mp4", "--frame-rate", "24", "--rotation", "2"],
+        "send_video",
+        True,
+        lambda c: c[1]["frame_rate"] == 24 and c[1]["rotation"] == 2 and c[1]["brightness"] is None,
+    ),
     "upload": (["upload", "--path", "a.png"], "upload_file", True, lambda c: c[0][1] == "a.png"),
     "delete": (["delete", "--filename", "a.png"], "delete_file", True, lambda c: c[0][1] == "a.png"),
-    "play-select": (["play-select", "--filename", "a.png", "--brightness", "40"], "play_stored_asset", True,
-                    lambda c: c[1]["brightness"] == 40),
+    "play-select": (
+        ["play-select", "--filename", "a.png", "--brightness", "40"],
+        "play_stored_asset",
+        True,
+        lambda c: c[1]["brightness"] == 40,
+    ),
     "voltage": (["voltage"], "read_voltage", 5000, lambda c: True),
     "orientation": (["orientation"], "read_orientation", {"orientation": 1}, lambda c: True),
     "block-size": (["block-size"], "read_block_size", 0, lambda c: True),
-    "set-clock": (["set-clock", "--time", "2026-11-16T02:05:09", "--mode", "1"], "set_clock", b"ok",
-                  lambda c: c[0][1] == datetime.datetime(2026, 11, 16, 2, 5, 9) and c[1]["mode"] == 1),
+    "set-clock": (
+        ["set-clock", "--time", "2026-11-16T02:05:09", "--mode", "1"],
+        "set_clock",
+        b"ok",
+        lambda c: c[0][1] == datetime.datetime(2026, 11, 16, 2, 5, 9) and c[1]["mode"] == 1,
+    ),
     "run-state": (["run-state", "off"], "set_run_state", b"ok", lambda c: c[0][1] is False),
     "power-off": (["power-off", "--yes"], "power_off", b"ok", lambda c: True),
 }
@@ -114,8 +133,15 @@ def test_ctrl_c_exits_130(monkeypatch):
     def interrupted(*a, **k):
         raise KeyboardInterrupt
 
-    assert _run(monkeypatch, ["upload", "--path", "a.png"], send_refresh_storage_command=lambda d: {"x": 1},
-                upload_file=interrupted) == 130
+    assert (
+        _run(
+            monkeypatch,
+            ["upload", "--path", "a.png"],
+            send_refresh_storage_command=lambda d: {"x": 1},
+            upload_file=interrupted,
+        )
+        == 130
+    )
 
 
 def test_power_off_without_yes_does_not_open_the_device(monkeypatch):
@@ -141,8 +167,13 @@ def test_brightness_range_is_0_to_100():
 
 def test_unsupported_feature_is_not_sent(monkeypatch, caplog):
     sent = []
-    rc = _run(monkeypatch, ["voltage"], read_voltage=lambda dev: sent.append(1) or 0,
-              supports=lambda dev, f: False, unsupported_reason=lambda dev, f: "not supported by firmware 8 (x)")
+    rc = _run(
+        monkeypatch,
+        ["voltage"],
+        read_voltage=lambda dev: sent.append(1) or 0,
+        supports=lambda dev, f: False,
+        unsupported_reason=lambda dev, f: "not supported by firmware 8 (x)",
+    )
     assert rc == 1 and sent == []
     assert "not supported by firmware 8" in caplog.text and "--force" in caplog.text
 
