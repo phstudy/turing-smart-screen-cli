@@ -59,19 +59,26 @@ Installing the package provides a `turing-screen` console script.
 
 ## Command Summary
 
+- `info [--json]` – Firmware version, storage and playback status (read-only).
 - `sync` – Ping the panel to keep it responsive.
 - `restart` – Reboot the panel.
 - `refresh-storage` – Display SD card usage statistics.
 - `clear-image` – Push a transparent frame to clear the panel.
 - `stop-play` – Stop any active playback.
-- `brightness --value` – Set LCD brightness.
+- `brightness --value` – Set LCD brightness (the firmware caps it at 100).
+- `frame-rate --value` – Set the playback frame rate (1–60; `send-video` uses 25).
 - `save` – Persist brightness/startup/rotation/offline settings.
 - `list-storage --type image|video` – List files on the device.
-- `send-image --path` – Stream a PNG to the screen.
-- `send-video --path [--loop]` – Stream MP4/H264 video.
+- `send-image --path [--format png|jpeg|auto] [--quality N]` – Show an image now. `png` (default) splits a large
+  PNG into layers; `jpeg` sends one JPEG, lowering quality until it is under 1 MB; `auto` uses PNG when it fits one push.
+- `send-video --path [--loop] [--brightness N] [--rotation 0|2]` – Stream MP4/H264 video; brightness and rotation
+  are left as they are unless given (the panel saves a rotation change).
 - `upload --path` – Upload PNG/MP4 assets to storage.
 - `delete --filename` – Delete PNG/H264 assets.
-- `play-select --filename` – Play a stored PNG/H264 asset.
+- `play-select --filename [--brightness N]` – Play a stored PNG/H264 asset.
+
+`delete` and `play-select` take a plain file name only (no directories). The exit code is 1 whenever the panel
+does not answer, including `refresh-storage`, `list-storage` and `stop-play`.
 
 ## Development & Testing
 
@@ -96,6 +103,9 @@ Tests under `tests/` rely on pytest and exercise CLI argument parsing and dispat
 - Permission errors on Linux – create matching udev rules granting access to VID 0x1CBE/PID 0x0088 or run the CLI with elevated privileges.
 - FFmpeg not found – ensure FFmpeg is installed and on your `PATH` for video encoding.
 - Playback glitches – verify assets meet the device requirements (PNG 480×1920, H264 video when stored on the device).
+- `play-select` of a stored PNG reports a timeout (exit 1) – firmware `turzx_0001_0008` answers command 113 (show stored
+  image) only the first time after a restart or upload; later calls time out, so the CLI cannot tell whether it worked.
+  Check the screen. Stored H.264 playback (110) answers normally.
 
 ## Device Storage Structure
 

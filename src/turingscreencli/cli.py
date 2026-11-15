@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import sys
 
@@ -67,6 +68,8 @@ def create_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("refresh-storage", help="Show SD storage information")
     subparsers.add_parser("clear-image", help="Clear the current image")
     subparsers.add_parser("stop-play", help="Stop active playback")
+    info_parser = subparsers.add_parser("info", help="Show firmware version, storage and playback status")
+    info_parser.add_argument("--json", action="store_true", help="Print JSON instead of key: value lines")
 
     # Commands with arguments
     brightness_parser = subparsers.add_parser("brightness", help="Set screen brightness")
@@ -77,6 +80,16 @@ def create_parser() -> argparse.ArgumentParser:
         choices=range(0, 103),
         metavar="[0-102]",
         help="Brightness value (0–102)",
+    )
+
+    frame_rate_parser = subparsers.add_parser("frame-rate", help="Set the playback frame rate")
+    frame_rate_parser.add_argument(
+        "--value",
+        type=int,
+        required=True,
+        choices=range(1, 61),
+        metavar="[1-60]",
+        help="Frames per second (send-video uses 25)",
     )
 
     save_parser = subparsers.add_parser("save", help="Persist device settings")
@@ -143,7 +156,17 @@ def create_parser() -> argparse.ArgumentParser:
         "--path",
         type=str,
         required=True,
-        help="Path to PNG image (ideally 480x1920)",
+        help="Path to an image (ideally 480x1920)",
+    )
+    image_parser.add_argument(
+        "--format",
+        choices=["png", "jpeg", "auto"],
+        default="png",
+        help="png (default; split into layers if large), jpeg (one push, quality lowered to fit), "
+        "auto (PNG if it fits one push, else JPEG)",
+    )
+    image_parser.add_argument(
+        "--quality", type=int, default=90, choices=range(10, 101), metavar="[10-100]", help="JPEG quality (default 90)"
     )
 
     parser_video = subparsers.add_parser("send-video", help="Play a video on the screen")
@@ -157,6 +180,15 @@ def create_parser() -> argparse.ArgumentParser:
         "--loop",
         action="store_true",
         help="Loop the video playback until interrupted",
+    )
+    _add_brightness_option(parser_video)
+    parser_video.add_argument(
+        "--rotation",
+        type=int,
+        default=None,
+        choices=[0, 2],
+        metavar="[0|2]",
+        help="Also set the panel rotation (0 or 2 = 180°); the panel saves it (default: leave it)",
     )
 
     upload_parser = subparsers.add_parser("upload", help="Upload PNG or MP4 file to device storage")
@@ -182,8 +214,20 @@ def create_parser() -> argparse.ArgumentParser:
         required=True,
         help=".png or .h264 filename to play",
     )
+    _add_brightness_option(play_parser)
 
     return parser
+
+
+def _add_brightness_option(subparser) -> None:
+    subparser.add_argument(
+        "--brightness",
+        type=int,
+        default=None,
+        choices=range(0, 103),
+        metavar="[0-102]",
+        help="Also set the brightness (default: leave it as it is)",
+    )
 
 
 def run(argv=None, *, device_factory=transport.find_usb_device) -> int:
@@ -219,6 +263,17 @@ def run(argv=None, *, device_factory=transport.find_usb_device) -> int:
 def _dispatch_command(dev, args) -> bool:
     command = args.command
 
+    if command == "info":
+        operations.delay_sync(dev)
+        info = operations.read_device_info(dev)
+        if info is None:
+            return False
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            for key, value in info.items():
+                print(f"{key}: {value}")
+        return True
     if command == "sync":
         return operations.send_sync_command(dev) is not None
     if command == "restart":
@@ -226,11 +281,18 @@ def _dispatch_command(dev, args) -> bool:
         return operations.send_restart_device_command(dev) is not None
     if command == "refresh-storage":
         operations.delay_sync(dev)
-        operations.send_refresh_storage_command(dev)
+        storage = operations.send_refresh_storage_command(dev)
+        if storage is None:
+            return False
+        for key, value in storage.items():
+            print(f"{key}: {value}")
         return True
     if command == "brightness":
         operations.delay_sync(dev)
         return operations.send_brightness_command(dev, args.value) is not None
+    if command == "frame-rate":
+        operations.delay_sync(dev)
+        return operations.send_frame_rate_command(dev, args.value) is not None
     if command == "save":
         operations.delay_sync(dev)
         response = operations.send_save_settings_command(
@@ -245,21 +307,28 @@ def _dispatch_command(dev, args) -> bool:
         return response is not None
     if command == "list-storage":
         operations.delay_sync(dev)
-        path = "/tmp/sdcard/mmcblk0p1/img/" if args.type == "image" else "/tmp/sdcard/mmcblk0p1/video/"
-        operations.send_list_storage_command(dev, path)
+        path = operations.IMAGE_DIR if args.type == "image" else operations.VIDEO_DIR
+        names = operations.send_list_storage_command(dev, path)
+        if names is None:
+            return False
+        for name in names:
+            print(name)
         return True
     if command == "clear-image":
         operations.delay_sync(dev)
         return operations.clear_image(dev) is not None
     if command == "send-image":
         operations.delay_sync(dev)
-        return operations.send_image(dev, args.path)
+        return operations.send_image(dev, args.path, fmt=args.format, quality=args.quality)
     if command == "send-video":
         operations.delay_sync(dev)
-        return operations.send_video(dev, args.path, loop=args.loop)
+        return operations.send_video(
+            dev, args.path, loop=args.loop, brightness=args.brightness, rotation=args.rotation
+        )
     if command == "upload":
         operations.delay_sync(dev)
-        operations.send_refresh_storage_command(dev)
+        if not operations.send_refresh_storage_command(dev):
+            return False
         return operations.upload_file(dev, args.path)
     if command == "delete":
         operations.delay_sync(dev)
@@ -268,7 +337,7 @@ def _dispatch_command(dev, args) -> bool:
         operations.delay_sync(dev)
         return operations.stop_play(dev)
     if command == "play-select":
-        return operations.play_stored_asset(dev, args.filename)
+        return operations.play_stored_asset(dev, args.filename, brightness=args.brightness)
 
     raise ValueError(f"Unsupported command: {command}")
 
