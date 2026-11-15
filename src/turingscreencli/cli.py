@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import json
 import logging
 import sys
@@ -52,6 +53,11 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Send a command even if this panel's firmware is known not to support it",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -77,9 +83,9 @@ def create_parser() -> argparse.ArgumentParser:
         "--value",
         type=int,
         required=True,
-        choices=range(0, 103),
-        metavar="[0-102]",
-        help="Brightness value (0–102)",
+        choices=range(0, 101),
+        metavar="[0-100]",
+        help="Brightness value (0–100)",
     )
 
     frame_rate_parser = subparsers.add_parser("frame-rate", help="Set the playback frame rate")
@@ -96,10 +102,10 @@ def create_parser() -> argparse.ArgumentParser:
     save_parser.add_argument(
         "--brightness",
         type=int,
-        default=102,
-        choices=range(0, 103),
-        metavar="[0-102]",
-        help="Brightness value (0-102, default: 102)",
+        default=100,
+        choices=range(0, 101),
+        metavar="[0-100]",
+        help="Brightness value (0-100, default: 100)",
     )
     save_parser.add_argument(
         "--startup",
@@ -134,6 +140,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Sleep timeout (default: 0)",
     )
     save_parser.add_argument(
+        "--clock-direction",
+        type=int,
+        default=0,
+        choices=range(0, 4),
+        metavar="[0-3]",
+        help="Offline clock direction (the vendor app sends it; default: 0)",
+    )
+    save_parser.add_argument(
         "--offline",
         type=int,
         default=0,
@@ -141,6 +155,26 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="[0|1]",
         help="0 = Disabled, 1 = Enabled (default: 0)",
     )
+
+    rotate_parser = subparsers.add_parser("rotate", help="Set the panel rotation (13); the panel saves it")
+    rotate_parser.add_argument("--value", type=int, required=True, choices=[0, 2], metavar="[0|2]", help="0 or 2 (180°)")
+
+    size_parser = subparsers.add_parser("file-size", help="Size in bytes of a stored file (0 if missing)")
+    size_parser.add_argument("--filename", required=True, help=".png or .h264 filename")
+
+    subparsers.add_parser("voltage", help="Supply voltage in mV (0 on firmware that does not report it)")
+    subparsers.add_parser("orientation", help="Orientation sensor reading (newer firmware only)")
+    subparsers.add_parser("block-size", help="Stream block size the panel asks for (0 = default 202752)")
+
+    clock_parser = subparsers.add_parser("set-clock", help="Set the panel clock (the vendor app does this for the 4.6\")")
+    clock_parser.add_argument("--time", help="ISO time, e.g. 2026-11-16T02:05:00 (default: now)")
+    clock_parser.add_argument("--mode", type=int, default=0, choices=[0, 1, 2], help="Clock mode byte (default 0)")
+
+    run_parser = subparsers.add_parser("run-state", help="The vendor app's Run all / Stop all flag (49)")
+    run_parser.add_argument("state", choices=["on", "off"])
+
+    off_parser = subparsers.add_parser("power-off", help="Halt the panel until its power is cycled (12)")
+    off_parser.add_argument("--yes", action="store_true", help="Really do it")
 
     list_parser = subparsers.add_parser("list-storage", help="List files stored on the device")
     list_parser.add_argument(
@@ -224,8 +258,8 @@ def _add_brightness_option(subparser) -> None:
         "--brightness",
         type=int,
         default=None,
-        choices=range(0, 103),
-        metavar="[0-102]",
+        choices=range(0, 101),
+        metavar="[0-100]",
         help="Also set the brightness (default: leave it as it is)",
     )
 
@@ -260,86 +294,136 @@ def run(argv=None, *, device_factory=transport.find_usb_device) -> int:
     return 0 if success else 1
 
 
-def _dispatch_command(dev, args) -> bool:
-    command = args.command
-
-    if command == "info":
-        operations.delay_sync(dev)
-        info = operations.read_device_info(dev)
-        if info is None:
-            return False
-        if args.json:
-            print(json.dumps(info, indent=2))
-        else:
-            for key, value in info.items():
-                print(f"{key}: {value}")
-        return True
-    if command == "sync":
-        return operations.send_sync_command(dev) is not None
-    if command == "restart":
-        operations.delay_sync(dev)
-        return operations.send_restart_device_command(dev) is not None
-    if command == "refresh-storage":
-        operations.delay_sync(dev)
-        storage = operations.send_refresh_storage_command(dev)
-        if storage is None:
-            return False
-        for key, value in storage.items():
+def _print_mapping(mapping: dict, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(mapping, indent=2))
+    else:
+        for key, value in mapping.items():
             print(f"{key}: {value}")
-        return True
-    if command == "brightness":
-        operations.delay_sync(dev)
-        return operations.send_brightness_command(dev, args.value) is not None
-    if command == "frame-rate":
-        operations.delay_sync(dev)
-        return operations.send_frame_rate_command(dev, args.value) is not None
-    if command == "save":
-        operations.delay_sync(dev)
-        response = operations.send_save_settings_command(
-            dev,
-            brightness=args.brightness,
-            startup=args.startup,
-            reserved=args.reserved,
-            rotation=args.rotation,
-            sleep=args.sleep,
-            offline=args.offline,
-        )
-        return response is not None
-    if command == "list-storage":
-        operations.delay_sync(dev)
-        path = operations.IMAGE_DIR if args.type == "image" else operations.VIDEO_DIR
-        names = operations.send_list_storage_command(dev, path)
-        if names is None:
-            return False
-        for name in names:
-            print(name)
-        return True
-    if command == "clear-image":
-        operations.delay_sync(dev)
-        return operations.clear_image(dev) is not None
-    if command == "send-image":
-        operations.delay_sync(dev)
-        return operations.send_image(dev, args.path, fmt=args.format, quality=args.quality)
-    if command == "send-video":
-        operations.delay_sync(dev)
-        return operations.send_video(
-            dev, args.path, loop=args.loop, brightness=args.brightness, rotation=args.rotation
-        )
-    if command == "upload":
-        operations.delay_sync(dev)
-        if not operations.send_refresh_storage_command(dev):
-            return False
-        return operations.upload_file(dev, args.path)
-    if command == "delete":
-        operations.delay_sync(dev)
-        return operations.delete_file(dev, args.filename)
-    if command == "stop-play":
-        operations.delay_sync(dev)
-        return operations.stop_play(dev)
-    if command == "play-select":
-        return operations.play_stored_asset(dev, args.filename, brightness=args.brightness)
 
-    raise ValueError(f"Unsupported command: {command}")
+
+def _info(dev, args) -> bool:
+    info = operations.read_device_info(dev)
+    if info is None:
+        return False
+    _print_mapping(info, args.json)
+    return True
+
+
+def _refresh_storage(dev, args) -> bool:
+    storage = operations.send_refresh_storage_command(dev)
+    if storage is None:
+        return False
+    _print_mapping(storage)
+    return True
+
+
+def _list_storage(dev, args) -> bool:
+    path = operations.IMAGE_DIR if args.type == "image" else operations.VIDEO_DIR
+    names = operations.send_list_storage_command(dev, path)
+    if names is None:
+        return False
+    for name in names:
+        print(name)
+    return True
+
+
+def _upload(dev, args) -> bool:
+    if not operations.send_refresh_storage_command(dev):
+        return False
+    return operations.upload_file(dev, args.path)
+
+
+def _print_value(value, unit: str = "") -> bool:
+    if value is None:
+        return False
+    print(f"{value}{unit}")
+    return True
+
+
+def _orientation(dev, args) -> bool:
+    orientation = operations.read_orientation(dev)
+    if orientation is None:
+        print("not supported by this firmware")
+        return False
+    _print_mapping(orientation)
+    return True
+
+
+def _set_clock(dev, args) -> bool:
+    when = datetime.datetime.fromisoformat(args.time) if args.time else datetime.datetime.now()
+    return operations.set_clock(dev, when, mode=args.mode) is not None
+
+
+def _power_off(dev, args) -> bool:
+    if not args.yes:
+        logger.error("power-off halts the panel until its power is cycled; add --yes to do it")
+        return False
+    return operations.power_off(dev) is not None
+
+
+# Every subcommand: (handler, send a sync first, firmware feature it needs or None).
+# Features and their firmware versions are in operations.FIRMWARE_FEATURES. A test checks this matches the parser.
+COMMANDS = {
+    "info": (_info, True, None),
+    "sync": (lambda dev, a: operations.send_sync_command(dev) is not None, False, None),
+    "restart": (lambda dev, a: operations.send_restart_device_command(dev) is not None, True, None),
+    "refresh-storage": (_refresh_storage, True, None),
+    "clear-image": (lambda dev, a: operations.clear_image(dev) is not None, True, None),
+    "stop-play": (lambda dev, a: operations.stop_play(dev), True, None),
+    "brightness": (lambda dev, a: operations.send_brightness_command(dev, a.value) is not None, True, None),
+    "frame-rate": (lambda dev, a: operations.send_frame_rate_command(dev, a.value) is not None, True, None),
+    "rotate": (lambda dev, a: operations.set_rotation(dev, a.value) is not None, True, None),
+    "save": (
+        lambda dev, a: operations.send_save_settings_command(
+            dev,
+            brightness=a.brightness,
+            startup=a.startup,
+            reserved=a.reserved,
+            rotation=a.rotation,
+            sleep=a.sleep,
+            offline=a.offline,
+            clock_direction=a.clock_direction,
+        )
+        is not None,
+        True,
+        None,
+    ),
+    "list-storage": (_list_storage, True, None),
+    "file-size": (lambda dev, a: _print_value(operations.file_size(dev, a.filename)), True, None),
+    "send-image": (lambda dev, a: operations.send_image(dev, a.path, fmt=a.format, quality=a.quality), True, None),
+    "send-video": (
+        lambda dev, a: operations.send_video(dev, a.path, loop=a.loop, brightness=a.brightness, rotation=a.rotation),
+        True,
+        None,
+    ),
+    "upload": (_upload, True, None),
+    "delete": (lambda dev, a: operations.delete_file(dev, a.filename), True, None),
+    "play-select": (lambda dev, a: operations.play_stored_asset(dev, a.filename, brightness=a.brightness), False, None),
+    "voltage": (lambda dev, a: _print_value(operations.read_voltage(dev), " mV"), True, "voltage"),
+    "orientation": (_orientation, True, "orientation"),
+    "block-size": (lambda dev, a: _print_value(operations.read_block_size(dev)), True, "block_size"),
+    "set-clock": (_set_clock, True, "set_clock"),
+    "run-state": (lambda dev, a: operations.set_run_state(dev, a.state == "on") is not None, True, "run_state"),
+    "power-off": (_power_off, True, None),
+}
+
+
+def _dispatch_command(dev, args) -> bool:
+    try:
+        handler, sync_first, feature = COMMANDS[args.command]
+    except KeyError:
+        raise ValueError(f"Unsupported command: {args.command}") from None
+    if sync_first:
+        operations.delay_sync(dev)
+    if feature is not None and not getattr(args, "force", False) and not operations.supports(dev, feature):
+        needed = operations.FIRMWARE_FEATURES[feature]
+        print(
+            f"{args.command}: not supported by firmware {operations.firmware_version(dev)} "
+            f"(needs {needed.min_version} or later; {needed.evidence}). Use --force to send it anyway."
+        )
+        return False
+    return bool(handler(dev, args))
 
 
 def main(argv=None):

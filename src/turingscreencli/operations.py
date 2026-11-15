@@ -8,6 +8,7 @@ import math
 import subprocess
 import time
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from PIL import Image
@@ -64,6 +65,55 @@ def format_bytes(val: int) -> str:
 # device does not report a block size (17 is not handled by the 8.8" firmware).
 UPLOAD_CHUNK_BYTES = 202752
 STREAM_CHUNK_BYTES = 202752
+
+@dataclass(frozen=True)
+class Feature:
+    min_version: int  # first firmware version (the number after the last "_" of command 10's reply) that has it
+    evidence: str
+
+
+# Behaviour that differs between panel firmware versions: the single list. Commands check it with
+# supports(); a feature no known firmware has gets LATEST_KNOWN_FIRMWARE + 1, so it is only tried on newer ones.
+LATEST_KNOWN_FIRMWARE = 15
+FIRMWARE_FEATURES = {
+    # Measured on firmware 0008 and 0015.
+    "stored_image_reply": Feature(
+        LATEST_KNOWN_FIRMWARE + 1,
+        "113 answers only the first time after a restart or upload on 0008 and on 0015 (measured)",
+    ),
+    "chip_id": Feature(15, "240 returns a 16-byte chip id on 0015, zeros on 0008 (measured)"),
+    "voltage": Feature(LATEST_KNOWN_FIRMWARE + 1, "50 answers zeros on 0008 and 0015"),
+    "orientation": Feature(LATEST_KNOWN_FIRMWARE + 1, "60 answers zeros on 0008 and 0015"),
+    "run_state": Feature(LATEST_KNOWN_FIRMWARE + 1, "49 is a plain ack on 0008 and 0015"),
+    "block_size": Feature(LATEST_KNOWN_FIRMWARE + 1, "17 answers zeros on 0008 and 0015"),
+    "set_clock": Feature(LATEST_KNOWN_FIRMWARE + 1, "51 is a plain ack on 0008 and 0015"),
+}
+
+_FIRMWARE_CACHE: dict = {}
+
+
+def firmware_version(dev) -> Optional[int]:
+    """Firmware version number from command 10 (e.g. 8 for turzx_0001_0008), cached per device.
+
+    None if the panel does not answer or the version string has no number.
+    """
+    key = id(dev)
+    if key not in _FIRMWARE_CACHE:
+        response = write_to_device(dev, encrypt_command_packet(build_command_packet_header(10)))
+        version = None
+        if response is not None and len(response) >= 40 and response[0] == 10:
+            text = bytes(response[8:40]).split(b"\0", 1)[0].decode("utf-8", errors="replace")
+            last = text.rsplit("_", 1)[-1]
+            version = int(last) if last.isdigit() else None
+        _FIRMWARE_CACHE[key] = version
+    return _FIRMWARE_CACHE[key]
+
+
+def supports(dev, feature: str) -> bool:
+    """Whether this panel's firmware has `feature` (FIRMWARE_FEATURES). Unknown versions are assumed to."""
+    version = firmware_version(dev)
+    return version is None or version >= FIRMWARE_FEATURES[feature].min_version
+
 
 # One image push (101 / 102) must stay under about 1 MiB or the panel times out.
 MAX_IMAGE_BYTES = 1_000_000
@@ -123,7 +173,19 @@ def play_file2(dev, filename: str) -> bool:
 
 
 def play_file3(dev, filename: str) -> bool:
-    """Show a stored PNG/JPG (113)."""
+    """Show a stored PNG/JPG (113).
+
+    Firmware without "stored_image_reply" often does not answer; that is not counted as a failure.
+    """
+    if not supports(dev, "stored_image_reply"):
+        device_path = device_path_for(filename)
+        if device_path is None:
+            return False
+        logger.info("Play: %s", device_path)
+        response = write_to_device(dev, encrypt_command_packet(_path_packet(113, device_path)))
+        if response is None:
+            logger.warning("Firmware %s does not confirm showing a stored image; check the screen.", firmware_version(dev))
+        return True
     return play_file(dev, filename, _play3_command)
 
 
@@ -233,6 +295,7 @@ def read_device_info(dev) -> Optional[dict]:
     last = firmware.rsplit("_", 1)[-1]
     if last.isdigit():
         info["firmware_version"] = int(last)
+    _FIRMWARE_CACHE[id(dev)] = info.get("firmware_version")
 
     storage = _query(dev, 100)
     if storage is not None:
@@ -244,10 +307,91 @@ def read_device_info(dev) -> Optional[dict]:
     queue = _query(dev, 122)
     if queue is not None:
         info["stream_queue"] = queue[8]
-    chip = _query(dev, 240)  # older firmware answers with zeros
-    if chip is not None and any(chip[8:24]):
-        info["chip_id"] = chip[8:24].hex()
+    if supports(dev, "chip_id"):
+        chip = _query(dev, 240)
+        if chip is not None and any(chip[8:24]):
+            info["chip_id"] = chip[8:24].hex()
     return info
+
+
+ORIENTATIONS = ("portrait-0", "landscape-90", "portrait-180", "landscape-270")
+
+
+def set_rotation(dev, rotation: int):
+    """13: set the panel rotation; the panel saves it. 0 or 2 (180°) on the 8.8"."""
+    packet = build_command_packet_header(13)
+    packet[8] = rotation
+    return write_to_device(dev, encrypt_command_packet(packet))
+
+
+def _path_packet(command_id: int, device_path: str) -> bytearray:
+    path_bytes = device_path.encode("ascii")
+    packet = build_command_packet_header(command_id)
+    packet[8:12] = len(path_bytes).to_bytes(4, "big")
+    packet[16 : 16 + len(path_bytes)] = path_bytes
+    return packet
+
+
+def file_size(dev, filename: str) -> Optional[int]:
+    """98: size in bytes of a stored .png / .h264 (0 if it does not exist)."""
+    device_path = device_path_for(filename)
+    if device_path is None:
+        return None
+    response = write_to_device(dev, encrypt_command_packet(_path_packet(98, device_path)))
+    if response is None or len(response) < 12:
+        logger.error("Panel did not answer the file size query (98)")
+        return None
+    return int.from_bytes(response[8:12], "little")
+
+
+def read_voltage(dev) -> Optional[int]:
+    """50: supply voltage in mV (0 on firmware that does not report it)."""
+    response = _query(dev, 50)
+    return None if response is None else int.from_bytes(response[8:12], "big")
+
+
+def read_orientation(dev) -> Optional[dict]:
+    """60: orientation sensor; None when the firmware has no sensor support (it answers zeros).
+
+    Like the vendor app's first probe, a reading of 0 (portrait-0) is treated as "no sensor".
+    """
+    response = write_to_device(dev, encrypt_command_packet(build_command_packet_header(60)), 250)
+    if response is None or len(response) < 10 or response[0] != 60 or response[1] != 200:
+        return None
+    # Vendor app (first probe): [9] must be non-zero; firmware without a sensor answers zeros.
+    if response[8] > 3 or response[9] > 3 or response[9] == 0:
+        return None
+    return {"sensor": response[8], "orientation": response[9], "name": ORIENTATIONS[response[9]]}
+
+
+def read_block_size(dev) -> Optional[int]:
+    """17: stream block size the panel wants; 0 means use the default (202752)."""
+    response = _query(dev, 17)
+    return None if response is None else int.from_bytes(response[8:12], "big")
+
+
+def set_clock(dev, when, mode: int = 0):
+    """51: set the panel clock: [8..9] year (big-endian), month, day, hour, minute, second, [15] mode 0/1/2.
+
+    The vendor app sends it only to the 4.6" model; the 8.8" firmware acknowledges it.
+    """
+    packet = build_command_packet_header(51)
+    packet[8:10] = when.year.to_bytes(2, "big")
+    packet[10:15] = bytes([when.month, when.day, when.hour, when.minute, when.second])
+    packet[15] = mode
+    return write_to_device(dev, encrypt_command_packet(packet))
+
+
+def set_run_state(dev, running: bool):
+    """49: the vendor app's "Run all" / "Stop all" (multi-device page); [8] = 1 or 0."""
+    packet = build_command_packet_header(49)
+    packet[8] = 1 if running else 0
+    return write_to_device(dev, encrypt_command_packet(packet))
+
+
+def power_off(dev):
+    """12: halt the panel (the vendor app sends it on exit). It stays off until power is cycled."""
+    return write_to_device(dev, encrypt_command_packet(build_command_packet_header(12)))
 
 
 def send_save_settings_command(
@@ -258,6 +402,7 @@ def send_save_settings_command(
     rotation: int = 0,
     sleep: int = 0,
     offline: int = 0,
+    clock_direction: int = 0,
 ):
     logger.info("Saving device settings...")
     logger.info("  Brightness:     %d", brightness)
@@ -266,6 +411,7 @@ def send_save_settings_command(
     logger.info("  Rotation:       %d", rotation)
     logger.info("  Sleep Timeout:  %d", sleep)
     logger.info("  Offline Mode:   %d", offline)
+    logger.info("  Clock Direction:%d", clock_direction)
 
     cmd_packet = build_command_packet_header(125)
     cmd_packet[8] = brightness
@@ -274,6 +420,7 @@ def send_save_settings_command(
     cmd_packet[11] = rotation
     cmd_packet[12] = sleep
     cmd_packet[13] = offline
+    cmd_packet[14] = clock_direction  # the vendor app adds this; firmware 0015 stores only [8..13]
 
     return write_to_device(dev, encrypt_command_packet(cmd_packet))
 
@@ -598,6 +745,7 @@ def send_video(
 
         try:
             while True:
+                file_size_bytes = Path(output_path).stat().st_size
                 with open(output_path, "rb") as fh:
                     chunk_count = 0
                     while True:
@@ -611,10 +759,8 @@ def send_video(
                             logger.info("Sending chunk #%d (%d bytes)", chunk_count, chunk_size)
 
                         cmd_packet = build_command_packet_header(121)
-                        cmd_packet[8] = (chunk_size >> 24) & 0xFF
-                        cmd_packet[9] = (chunk_size >> 16) & 0xFF
-                        cmd_packet[10] = (chunk_size >> 8) & 0xFF
-                        cmd_packet[11] = chunk_size & 0xFF
+                        cmd_packet[8:12] = chunk_size.to_bytes(4, "big")
+                        cmd_packet[12] = 1 if fh.tell() >= file_size_bytes else 0  # last chunk, as the vendor app
 
                         full_payload = encrypt_command_packet(cmd_packet) + data
                         response = write_to_device(dev, full_payload)

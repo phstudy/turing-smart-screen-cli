@@ -65,10 +65,12 @@ Installing the package provides a `turing-screen` console script.
 - `refresh-storage` – Display SD card usage statistics.
 - `clear-image` – Push a transparent frame to clear the panel.
 - `stop-play` – Stop any active playback.
-- `brightness --value` – Set LCD brightness (the firmware caps it at 100).
+- `brightness --value` – Set LCD brightness (0–100, as the vendor app sends it).
 - `frame-rate --value` – Set the playback frame rate (1–60; `send-video` uses 25).
-- `save` – Persist brightness/startup/rotation/offline settings.
+- `save` – Persist brightness/startup/rotation/sleep/offline settings and the offline clock direction (`--clock-direction`).
+- `rotate --value 0|2` – Set the rotation (the panel saves it).
 - `list-storage --type image|video` – List files on the device.
+- `file-size --filename` – Size of a stored file in bytes (0 if missing).
 - `send-image --path [--format png|jpeg|auto] [--quality N]` – Show an image now. `png` (default) splits a large
   PNG into layers; `jpeg` sends one JPEG, lowering quality until it is under 1 MB; `auto` uses PNG when it fits one push.
 - `send-video --path [--loop] [--brightness N] [--rotation 0|2]` – Stream MP4/H264 video; brightness and rotation
@@ -76,9 +78,28 @@ Installing the package provides a `turing-screen` console script.
 - `upload --path` – Upload PNG/MP4 assets to storage.
 - `delete --filename` – Delete PNG/H264 assets.
 - `play-select --filename [--brightness N]` – Play a stored PNG/H264 asset.
+- `voltage`, `orientation`, `block-size` – Read-only queries the vendor app uses; firmware
+  `turzx_0001_0008` answers zeros (orientation then reports "not supported").
+- `set-clock [--time ISO] [--mode 0|1|2]` – Set the panel clock (the vendor app sends it to the 4.6" only).
+- `run-state on|off` – The vendor app's "Run all / Stop all" flag (49).
+- `power-off --yes` – Halt the panel (12); it stays off until its power is cycled.
 
 `delete` and `play-select` take a plain file name only (no directories). The exit code is 1 whenever the panel
 does not answer, including `refresh-storage`, `list-storage` and `stop-play`.
+
+## Firmware differences
+
+The CLI reads the panel's firmware version (`info` shows it, e.g. `turzx_0001_0008` = 8) and checks
+`FIRMWARE_FEATURES` in `operations.py`, the single list of behaviour that differs between versions:
+
+| Feature | From firmware | What the CLI does on older firmware |
+|---|---|---|
+| `stored_image_reply` (113 always answers) | none known (16) | `play-select` of a PNG does not count a missing reply as failure (0008 and 0015 answer only the first time after a restart or upload); check the screen |
+| `chip_id` (240) | 15 | `info` does not ask for it |
+| `voltage`, `orientation`, `block_size`, `set_clock`, `run_state` | none known (16) | the command prints "not supported by firmware N" and exits 1; `--force` sends it anyway |
+
+Measured on firmware 0008 and 0015.
+To add a difference, add a line to `FIRMWARE_FEATURES` and check it with `supports(dev, "<feature>")`.
 
 ## Development & Testing
 
@@ -103,9 +124,6 @@ Tests under `tests/` rely on pytest and exercise CLI argument parsing and dispat
 - Permission errors on Linux – create matching udev rules granting access to VID 0x1CBE/PID 0x0088 or run the CLI with elevated privileges.
 - FFmpeg not found – ensure FFmpeg is installed and on your `PATH` for video encoding.
 - Playback glitches – verify assets meet the device requirements (PNG 480×1920, H264 video when stored on the device).
-- `play-select` of a stored PNG reports a timeout (exit 1) – firmware `turzx_0001_0008` answers command 113 (show stored
-  image) only the first time after a restart or upload; later calls time out, so the CLI cannot tell whether it worked.
-  Check the screen. Stored H.264 playback (110) answers normally.
 
 ## Device Storage Structure
 

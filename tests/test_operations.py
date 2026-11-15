@@ -47,6 +47,7 @@ def rec(monkeypatch):
     r = Recorder()
     monkeypatch.setattr(operations, "write_to_device", r)
     monkeypatch.setattr(operations.time, "sleep", lambda s: None)
+    monkeypatch.setattr(operations, "_FIRMWARE_CACHE", {})
     return r
 
 
@@ -219,9 +220,9 @@ def _reply(code, payload=b""):
 def test_device_info_reads_version_storage_and_status(rec):
     storage = b"".join(v.to_bytes(4, "little") for v in (61053344, 2848, 61050496, 0, 0, 0))
     rec.replies = [_reply(10, b"turzx_0001_0008"), _reply(100, storage), _reply(112, b"\x00"),
-                   _reply(122, b"\x02"), _reply(240, bytes(16))]
+                   _reply(122, b"\x02")]
     info = operations.read_device_info(None)
-    assert rec.commands() == [10, 100, 112, 122, 240]
+    assert rec.commands() == [10, 100, 112, 122]  # no 240 (chip id) before firmware 15
     assert info == {
         "firmware": "turzx_0001_0008",
         "firmware_version": 8,
@@ -299,3 +300,133 @@ def test_list_storage_waits_for_data_then_stops_at_padding(rec):
                                       b"b.png/".ljust(512, b"\0")] + [bytes(512)] * 10
     assert operations.send_list_storage_command(None, "/x/") == ["a.png", "b.png"]
     assert len(rec.writes) == 11
+
+
+# --- commands from the vendor app, layouts as the app builds them
+
+
+def test_stream_marks_last_chunk(rec, tmp_path, monkeypatch):
+    clip = tmp_path / "c.mp4.h264"
+    clip.write_bytes(b"v" * 25)
+    monkeypatch.setattr(operations, "extract_h264_from_mp4", lambda p: clip)
+    monkeypatch.setattr(operations, "STREAM_CHUNK_BYTES", 10)
+    operations.send_video(None, "c.mp4")
+    assert [h[12] for h in rec.headers() if h[0] == 121] == [0, 0, 1]
+
+
+def test_save_settings_clock_direction(rec):
+    operations.send_save_settings_command(None, brightness=80, clock_direction=1)
+    (h,) = rec.headers()
+    assert list(h[8:15]) == [80, 0, 0, 0, 0, 0, 1]
+
+
+def test_set_rotation(rec):
+    operations.set_rotation(None, 2)
+    (h,) = rec.headers()
+    assert h[0] == 13 and h[8] == 2
+
+
+def test_file_size(rec):
+    rec.replies = [_reply(98, (6809).to_bytes(4, "little"))]
+    assert operations.file_size(None, "a.png") == 6809
+    (h,) = rec.headers()
+    path = b"/tmp/sdcard/mmcblk0p1/img/a.png"
+    assert h[0] == 98 and int.from_bytes(h[8:12], "big") == len(path) and h[16 : 16 + len(path)] == path
+
+
+def test_file_size_rejects_paths(rec):
+    assert operations.file_size(None, "../a.png") is None
+    assert rec.writes == []
+
+
+def test_read_voltage(rec):
+    rec.replies = [_reply(50, (5012).to_bytes(4, "big"))]
+    assert operations.read_voltage(None) == 5012
+
+
+def test_read_orientation(rec):
+    rec.replies = [_reply(60, bytes([1, 3]))]
+    assert operations.read_orientation(None) == {"sensor": 1, "orientation": 3, "name": "landscape-270"}
+
+
+def test_read_orientation_unsupported(rec):
+    rec.replies = [bytes(512)]  # no reply data at all
+    assert operations.read_orientation(None) is None
+    rec.replies = [_reply(60)]  # firmware 0008: [0]=60, [1]=200, data zeros
+    assert operations.read_orientation(None) is None
+
+
+def test_read_block_size(rec):
+    rec.replies = [_reply(17, (524288).to_bytes(4, "big"))]
+    assert operations.read_block_size(None) == 524288
+    rec.replies = [_reply(17)]
+    assert operations.read_block_size(None) == 0
+
+
+def test_set_clock(rec):
+    import datetime
+    operations.set_clock(None, datetime.datetime(2026, 11, 16, 2, 5, 9), mode=1)
+    (h,) = rec.headers()
+    assert h[0] == 51
+    assert int.from_bytes(h[8:10], "big") == 2026 and list(h[10:16]) == [11, 16, 2, 5, 9, 1]
+
+
+def test_set_run_state(rec):
+    operations.set_run_state(None, False)
+    (h,) = rec.headers()
+    assert h[0] == 49 and h[8] == 0
+
+
+def test_power_off(rec):
+    operations.power_off(None)
+    assert rec.commands() == [12]
+
+
+# --- firmware differences (operations.FIRMWARE_FEATURES)
+
+
+def test_every_feature_has_a_version_and_evidence():
+    for name, feature in operations.FIRMWARE_FEATURES.items():
+        assert isinstance(feature.min_version, int), name
+        assert feature.evidence, name
+
+
+def test_supports_reads_version_once(rec):
+    dev = object()
+    rec.replies = [_reply(10, b"turzx_0001_0008")]
+    assert operations.supports(dev, "chip_id") is False
+    assert operations.supports(dev, "voltage") is False
+    assert rec.commands() == [10]
+
+
+def test_supports_newer_firmware(rec):
+    rec.replies = [_reply(10, b"turzx_0001_0015")]
+    dev = object()
+    assert operations.supports(dev, "chip_id") is True
+    assert operations.supports(dev, "voltage") is False  # not in 0015 either
+
+
+def test_unknown_version_string_assumes_supported(rec):
+    rec.replies = [_reply(10, b"something-else")]
+    assert operations.supports(object(), "voltage") is True
+
+
+def test_info_skips_chip_id_on_old_firmware(rec):
+    rec.replies = [_reply(10, b"turzx_0001_0008"), _reply(100), _reply(112), _reply(122)]
+    info = operations.read_device_info(object())
+    assert info is not None and "chip_id" not in info
+    assert 240 not in rec.commands()
+
+
+def test_play_stored_png_without_reply_is_ok_on_0008(rec):
+    dev = object()
+    rec.default = None
+    operations._FIRMWARE_CACHE[id(dev)] = 8
+    assert operations.play_file3(dev, "a.png") is True
+
+
+def test_play_stored_png_without_reply_fails_on_newer_firmware(rec):
+    dev = object()
+    rec.default = None
+    operations._FIRMWARE_CACHE[id(dev)] = operations.LATEST_KNOWN_FIRMWARE + 1
+    assert operations.play_file3(dev, "a.png") is False

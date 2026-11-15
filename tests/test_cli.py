@@ -66,6 +66,7 @@ def test_run_play_select_invalid_extension(monkeypatch):
 def _run(monkeypatch, argv, **ops):
     monkeypatch.setattr(cli, "configure_logging", _noop)
     monkeypatch.setattr(cli.operations, "delay_sync", lambda dev: None)
+    monkeypatch.setattr(cli.operations, "supports", lambda dev, feature: True)
     for name, fn in ops.items():
         monkeypatch.setattr(cli.operations, name, fn)
     return cli.run(argv, device_factory=lambda: object())
@@ -138,3 +139,59 @@ def test_refresh_storage_prints_sizes(monkeypatch, capsys):
     assert _run(monkeypatch, ["refresh-storage"],
                 send_refresh_storage_command=lambda dev: {"total_kb": 10, "used_kb": 1, "free_kb": 9}) == 0
     assert "used_kb: 1" in capsys.readouterr().out
+
+
+def test_every_subcommand_has_a_handler():
+    parser = cli.create_parser()
+    sub = next(a for a in parser._actions if a.dest == "command")
+    assert sub.choices is not None
+    assert set(sub.choices) == set(cli.COMMANDS)
+
+
+def test_power_off_needs_yes(monkeypatch):
+    sent = []
+    assert _run(monkeypatch, ["power-off"], power_off=lambda dev: sent.append(1) or b"ok") == 1
+    assert sent == []
+    assert _run(monkeypatch, ["power-off", "--yes"], power_off=lambda dev: sent.append(1) or b"ok") == 0
+    assert sent == [1]
+
+
+def test_brightness_range_is_0_to_100():
+    parser = cli.create_parser()
+    parser.parse_args(["brightness", "--value", "100"])
+    import pytest
+    with pytest.raises(SystemExit):
+        parser.parse_args(["brightness", "--value", "101"])
+
+
+def test_orientation_unsupported_exits_1(monkeypatch, capsys):
+    assert _run(monkeypatch, ["orientation"], read_orientation=lambda dev: None) == 1
+    assert "not supported" in capsys.readouterr().out
+
+
+def test_set_clock_parses_time(monkeypatch):
+    seen = []
+    clock = lambda dev, when, mode=0: seen.append((when, mode)) or b"ok"  # noqa: E731
+    assert _run(monkeypatch, ["set-clock", "--time", "2026-11-16T02:05:09", "--mode", "1"], set_clock=clock) == 0
+    import datetime
+    assert seen == [(datetime.datetime(2026, 11, 16, 2, 5, 9), 1)]
+
+
+def test_every_gated_command_names_a_known_feature():
+    for name, (_handler, _sync, feature) in cli.COMMANDS.items():
+        assert feature is None or feature in cli.operations.FIRMWARE_FEATURES, name
+
+
+def test_unsupported_feature_is_not_sent(monkeypatch, capsys):
+    sent = []
+    rc = _run(monkeypatch, ["voltage"], read_voltage=lambda dev: sent.append(1) or 0,
+              supports=lambda dev, f: False, firmware_version=lambda dev: 8)
+    assert rc == 1 and sent == []
+    assert "not supported by firmware 8" in capsys.readouterr().out
+
+
+def test_force_sends_anyway(monkeypatch):
+    sent = []
+    rc = _run(monkeypatch, ["--force", "voltage"], read_voltage=lambda dev: sent.append(1) or 0,
+              supports=lambda dev, f: False, firmware_version=lambda dev: 8)
+    assert rc == 0 and sent == [1]
