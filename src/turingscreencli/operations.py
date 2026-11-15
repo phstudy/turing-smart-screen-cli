@@ -1,15 +1,21 @@
-"""High-level device operations for the Turing Smart Screen."""
+"""High-level device operations for the Turing Smart Screen 8.8" (USB 1cbe:0088).
+
+Packet layouts follow the vendor app; reply checks follow what the
+panel actually answers (measured on firmware 0008 and 0015).
+"""
 
 from __future__ import annotations
 
+import base64
 import io
+import json
 import logging
 import math
 import subprocess
 import time
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Optional
 
 from PIL import Image
 
@@ -21,38 +27,173 @@ build_command_packet_header = transport.build_command_packet_header
 encrypt_command_packet = transport.encrypt_command_packet
 write_to_device = transport.write_to_device
 
+OK = 200  # status byte the panel puts in its replies
+
+# Chunk sizes for 39 (file write) and 121 (H.264 stream); the vendor app uses 202752 when the
+# panel does not report a block size (17 is not handled by the 8.8" firmware).
+UPLOAD_CHUNK_BYTES = 202752
+STREAM_CHUNK_BYTES = 202752
+
+# One image push (101 / 102) must stay under about 1 MiB or the panel times out.
+MAX_IMAGE_BYTES = 1_000_000
+
+IMAGE_DIR = "/tmp/sdcard/mmcblk0p1/img/"
+VIDEO_DIR = "/tmp/sdcard/mmcblk0p1/video/"
+
+# A transparent 480x1920 PNG: what the vendor app pushes (102) to clear the panel.
+_BLANK_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAeAAAAeACAYAAAAW8IT1AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAA4MSURBVHhe7cEBDQAAAMKg909tDwcUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8GZKyAABEZ2CCgAAAABJRU5ErkJggg==")
+
+
+# ---------------------------------------------------------------- firmware differences
+
+
+@dataclass(frozen=True)
+class Feature:
+    """A behaviour that differs between firmware versions.
+
+    min_version: first firmware that has it, or None if no firmware checked so far has it.
+    checked_up_to: highest firmware version this entry was checked against; anything newer is
+        assumed to have the feature until someone checks it and updates this entry.
+    """
+
+    min_version: Optional[int]
+    checked_up_to: int
+    evidence: str
+
+
+# The single list of firmware-dependent behaviour. Commands check it with supports().
+# Measured on firmware 0008 and 0015.
+FIRMWARE_FEATURES = {
+    "stored_image_reply": Feature(None, 15, "113 answers only the first time after a restart or upload"),
+    "chip_id": Feature(15, 15, "240 returns a 16-byte chip id on 0015, zeros on 0008"),
+    "voltage": Feature(None, 15, "50 answers zeros"),
+    "orientation": Feature(None, 15, "60 answers zeros"),
+    "run_state": Feature(None, 15, "49 is a plain ack"),
+    "block_size": Feature(None, 15, "17 answers zeros"),
+    "set_clock": Feature(None, 15, "51 is a plain ack"),
+}
+
+# Firmware version per device object, filled from any reply to command 10. A failed or
+# unparseable read is not cached, so the next call asks again.
+_FIRMWARE_CACHE: dict = {}
+
+
+def _version_from_reply(response) -> tuple:
+    """(firmware string, version number or None) from a reply to command 10, or (None, None)."""
+    if response is None or len(response) < 40 or response[0] != 10:
+        return None, None
+    text = bytes(response[8:40]).split(b"\0", 1)[0].decode("utf-8", errors="replace")
+    last = text.rsplit("_", 1)[-1]
+    return text, (int(last) if last.isdigit() else None)
+
+
+def _remember_version(dev, response) -> None:
+    _text, version = _version_from_reply(response)
+    if version is not None:
+        _FIRMWARE_CACHE[id(dev)] = version
+
+
+def firmware_version(dev) -> Optional[int]:
+    """Firmware version number from command 10 (e.g. 8 for turzx_0001_0008); None if unknown."""
+    if id(dev) not in _FIRMWARE_CACHE:
+        _remember_version(dev, write_to_device(dev, encrypt_command_packet(build_command_packet_header(10))))
+    return _FIRMWARE_CACHE.get(id(dev))
+
+
+def supports(dev, feature: str) -> bool:
+    """Whether this panel's firmware has `feature`. Unknown or not-yet-checked versions are assumed to."""
+    entry = FIRMWARE_FEATURES[feature]
+    version = firmware_version(dev)
+    if version is None or version > entry.checked_up_to:
+        return True
+    return entry.min_version is not None and version >= entry.min_version
+
+
+def unsupported_reason(dev, feature: str) -> str:
+    entry = FIRMWARE_FEATURES[feature]
+    needs = (
+        f"needs firmware {entry.min_version} or later"
+        if entry.min_version is not None
+        else f"no firmware checked so far (up to {entry.checked_up_to}) has it"
+    )
+    return f"not supported by firmware {firmware_version(dev)} ({needs}; {entry.evidence})"
+
+
+# ---------------------------------------------------------------- packets and replies
+
+
+def _command(dev, command_id: int, timeout: int = 2000):
+    return write_to_device(dev, encrypt_command_packet(build_command_packet_header(command_id)), timeout)
+
+
+def _path_packet(command_id: int, device_path: str) -> bytearray:
+    """[8..11] path length (big-endian), path from [16]: 38, 40, 42, 98, 99, 110, 113."""
+    path_bytes = device_path.encode("ascii")
+    packet = build_command_packet_header(command_id)
+    packet[8:12] = len(path_bytes).to_bytes(4, "big")
+    packet[16 : 16 + len(path_bytes)] = path_bytes
+    return packet
+
+
+def _ok(response: Optional[bytes], command_id: int, status_at: int = 1) -> bool:
+    """A reply to command_id with OK at response[status_at]."""
+    return _accepted(response, command_id, status_at) is not None
+
+
+def _accepted(response: Optional[bytes], command_id: int, status_at: int = 1, min_len: int = 0) -> Optional[bytes]:
+    """The reply if it answers command_id with OK at response[status_at] (and is at least min_len long), else None."""
+    if (
+        response is None
+        or len(response) <= max(status_at, min_len - 1)
+        or response[0] != command_id
+        or response[status_at] != OK
+    ):
+        return None
+    return response
+
+
+def _query(dev, command_id: int) -> Optional[bytes]:
+    response = _command(dev, command_id)
+    if response is None or len(response) < 24 or response[0] != command_id:
+        return None
+    return bytes(response)
+
 
 def delay_sync(dev) -> None:
-    """Send a sync command and wait briefly."""
-    send_sync_command(dev)
+    """Send a sync (10, which also reports the firmware version) and wait briefly."""
+    _remember_version(dev, send_sync_command(dev))
     time.sleep(0.2)
 
 
 def send_sync_command(dev):
     logger.info("Sending sync command...")
-    cmd_packet = build_command_packet_header(10)
-    return write_to_device(dev, encrypt_command_packet(cmd_packet))
+    return _command(dev, 10)
 
 
 def send_restart_device_command(dev):
     logger.info("Sending restart command...")
-    return write_to_device(dev, encrypt_command_packet(build_command_packet_header(11)))
+    return _command(dev, 11)
 
 
 def send_brightness_command(dev, brightness: int):
-    logger.info("Updating brightness...")
-    logger.info("  Brightness = %d", brightness)
-    cmd_packet = build_command_packet_header(14)
-    cmd_packet[8] = brightness
-    return write_to_device(dev, encrypt_command_packet(cmd_packet))
+    logger.info("Brightness = %d", brightness)
+    packet = build_command_packet_header(14)
+    packet[8] = brightness
+    return write_to_device(dev, encrypt_command_packet(packet))
 
 
 def send_frame_rate_command(dev, frame_rate: int):
-    logger.info("Updating frame rate...")
-    logger.info("  Frame Rate = %d", frame_rate)
-    cmd_packet = build_command_packet_header(15)
-    cmd_packet[8] = frame_rate
-    return write_to_device(dev, encrypt_command_packet(cmd_packet))
+    logger.info("Frame rate = %d", frame_rate)
+    packet = build_command_packet_header(15)
+    packet[8] = frame_rate
+    return write_to_device(dev, encrypt_command_packet(packet))
+
+
+def set_rotation(dev, rotation: int):
+    """13: set the panel rotation; the panel saves it. 0 or 2 (180°) on the 8.8"."""
+    packet = build_command_packet_header(13)
+    packet[8] = rotation
+    return write_to_device(dev, encrypt_command_packet(packet))
 
 
 def format_bytes(val: int) -> str:
@@ -61,224 +202,153 @@ def format_bytes(val: int) -> str:
     return f"{val / 1024:.2f} MB"
 
 
-# Chunk sizes for 39 (file write) and 121 (H.264 stream); the vendor app uses 202752 when the
-# device does not report a block size (17 is not handled by the 8.8" firmware).
-UPLOAD_CHUNK_BYTES = 202752
-STREAM_CHUNK_BYTES = 202752
-
-@dataclass(frozen=True)
-class Feature:
-    min_version: int  # first firmware version (the number after the last "_" of command 10's reply) that has it
-    evidence: str
-
-
-# Behaviour that differs between panel firmware versions: the single list. Commands check it with
-# supports(); a feature no known firmware has gets LATEST_KNOWN_FIRMWARE + 1, so it is only tried on newer ones.
-LATEST_KNOWN_FIRMWARE = 15
-FIRMWARE_FEATURES = {
-    # Measured on firmware 0008 and 0015.
-    "stored_image_reply": Feature(
-        LATEST_KNOWN_FIRMWARE + 1,
-        "113 answers only the first time after a restart or upload on 0008 and on 0015 (measured)",
-    ),
-    "chip_id": Feature(15, "240 returns a 16-byte chip id on 0015, zeros on 0008 (measured)"),
-    "voltage": Feature(LATEST_KNOWN_FIRMWARE + 1, "50 answers zeros on 0008 and 0015"),
-    "orientation": Feature(LATEST_KNOWN_FIRMWARE + 1, "60 answers zeros on 0008 and 0015"),
-    "run_state": Feature(LATEST_KNOWN_FIRMWARE + 1, "49 is a plain ack on 0008 and 0015"),
-    "block_size": Feature(LATEST_KNOWN_FIRMWARE + 1, "17 answers zeros on 0008 and 0015"),
-    "set_clock": Feature(LATEST_KNOWN_FIRMWARE + 1, "51 is a plain ack on 0008 and 0015"),
-}
-
-_FIRMWARE_CACHE: dict = {}
-
-
-def firmware_version(dev) -> Optional[int]:
-    """Firmware version number from command 10 (e.g. 8 for turzx_0001_0008), cached per device.
-
-    None if the panel does not answer or the version string has no number.
-    """
-    key = id(dev)
-    if key not in _FIRMWARE_CACHE:
-        response = write_to_device(dev, encrypt_command_packet(build_command_packet_header(10)))
-        version = None
-        if response is not None and len(response) >= 40 and response[0] == 10:
-            text = bytes(response[8:40]).split(b"\0", 1)[0].decode("utf-8", errors="replace")
-            last = text.rsplit("_", 1)[-1]
-            version = int(last) if last.isdigit() else None
-        _FIRMWARE_CACHE[key] = version
-    return _FIRMWARE_CACHE[key]
-
-
-def supports(dev, feature: str) -> bool:
-    """Whether this panel's firmware has `feature` (FIRMWARE_FEATURES). Unknown versions are assumed to."""
-    version = firmware_version(dev)
-    return version is None or version >= FIRMWARE_FEATURES[feature].min_version
-
-
-# One image push (101 / 102) must stay under about 1 MiB or the panel times out.
-MAX_IMAGE_BYTES = 1_000_000
-
-IMAGE_DIR = "/tmp/sdcard/mmcblk0p1/img/"
-VIDEO_DIR = "/tmp/sdcard/mmcblk0p1/video/"
+# ---------------------------------------------------------------- files on the SD card
 
 
 def device_path_for(filename: str) -> Optional[str]:
-    """Path on the device's SD card for a stored .png / .h264, or None if the name is not acceptable.
+    """Path on the panel's SD card for a stored .png / .h264, or None if the name is not acceptable.
 
     Only a plain file name is accepted: no directories, no "..".
     """
     if not filename or filename != Path(filename).name or filename in (".", ".."):
-        logger.error("Error: give a plain file name (no directories): %r", filename)
+        logger.error("Give a plain file name (no directories): %r", filename)
         return None
     ext = Path(filename).suffix.lower()
     if ext == ".png":
         return IMAGE_DIR + filename
     if ext == ".h264":
         return VIDEO_DIR + filename
-    logger.error("Error: Unsupported file type. Only .png and .h264 are allowed.")
+    logger.error("Unsupported file type: only .png and .h264 are stored on the panel.")
     return None
 
 
+def file_size(dev, filename: str) -> Optional[int]:
+    """98: size in bytes of a stored .png / .h264 (0 if it does not exist)."""
+    device_path = device_path_for(filename)
+    if device_path is None:
+        return None
+    return _remote_size(dev, device_path)
+
+
+def _remote_size(dev, device_path: str) -> Optional[int]:
+    response = _accepted(write_to_device(dev, encrypt_command_packet(_path_packet(98, device_path))), 98, min_len=12)
+    if response is None:
+        logger.error("Panel did not answer the file size query (98)")
+        return None
+    return int.from_bytes(response[8:12], "little")
+
+
 def delete_file(dev, filename: str) -> bool:
+    """42: delete a stored file. The panel also answers OK when the file does not exist."""
     device_path = device_path_for(filename)
     if device_path is None:
         return False
     logger.info("Delete: %s", device_path)
-
-    if not _delete_command(dev, device_path):
-        logger.error("Failed to delete remote file.")
+    if not _ok(write_to_device(dev, encrypt_command_packet(_path_packet(42, device_path))), 42):
+        logger.error("Panel did not confirm the delete (42).")
         return False
-
-    logger.info("Delete completed successfully.")
     return True
-
-
-def play_file(dev, filename: str, play_command_func: Callable) -> bool:
-    device_path = device_path_for(filename)
-    if device_path is None:
-        return False
-    logger.info("Play: %s", device_path)
-
-    if not play_command_func(dev, device_path):
-        logger.error("Failed to play %s", device_path)
-        return False
-
-    logger.info("Play command sent successfully.")
-    return True
-
-
-def play_file2(dev, filename: str) -> bool:
-    """Play a stored H.264 file (110)."""
-    return play_file(dev, filename, _play2_command)
-
-
-def play_file3(dev, filename: str) -> bool:
-    """Show a stored PNG/JPG (113).
-
-    Firmware without "stored_image_reply" often does not answer; that is not counted as a failure.
-    """
-    if not supports(dev, "stored_image_reply"):
-        device_path = device_path_for(filename)
-        if device_path is None:
-            return False
-        logger.info("Play: %s", device_path)
-        response = write_to_device(dev, encrypt_command_packet(_path_packet(113, device_path)))
-        if response is None:
-            logger.warning("Firmware %s does not confirm showing a stored image; check the screen.", firmware_version(dev))
-        return True
-    return play_file(dev, filename, _play3_command)
 
 
 def upload_file(dev, file_path: str) -> bool:
+    """Store a .png (as is) or .mp4 (as .h264) on the SD card, then check its size there."""
     local_path = Path(file_path)
-    if not local_path.exists():
-        logger.error("Error: File does not exist: %s", file_path)
+    if not local_path.is_file():
+        logger.error("File does not exist: %s", file_path)
         return False
-
     ext = local_path.suffix.lower()
-    if ext == ".png":
+    if ext == ".mp4":
+        local_path = extract_h264_from_mp4(file_path)
+        device_path = VIDEO_DIR + local_path.name
+    elif ext == ".png":
         device_path = IMAGE_DIR + local_path.name
-        logger.info("Uploading PNG: %s → %s", file_path, device_path)
-    elif ext == ".mp4":
-        h264_path = extract_h264_from_mp4(file_path)
-        device_path = VIDEO_DIR + h264_path.name
-        local_path = h264_path  # Update local path to .h264
-        logger.info("Uploading MP4 as H264: %s → %s", local_path, device_path)
     else:
-        logger.error("Error: Unsupported file type. Only .png and .mp4 are allowed.")
+        logger.error("Unsupported file type: only .png and .mp4 can be uploaded.")
+        return False
+    size = local_path.stat().st_size
+    if size == 0:
+        logger.error("Refusing to upload an empty file: %s", local_path)
         return False
 
-    if not _open_file_command(dev, device_path):
-        logger.error("Failed to open remote file for writing.")
+    logger.info("Uploading %s → %s (%d bytes)", local_path, device_path, size)
+    # 38 opens the file; the panel answers OK at [8] (even for a missing folder, so the size check below matters).
+    if not _ok(write_to_device(dev, encrypt_command_packet(_path_packet(38, device_path))), 38, status_at=8):
+        logger.error("Panel did not open %s for writing (38).", device_path)
         return False
-
-    if not _write_file_command(dev, str(local_path)):
-        logger.error("Failed to write file data.")
+    if not _write_file_chunks(dev, local_path, size):
         return False
-
-    logger.info("Upload completed successfully.")
+    stored = _remote_size(dev, device_path)
+    if stored != size:
+        logger.error("Upload check failed: %s is %s bytes on the panel, %d locally.", device_path, stored, size)
+        return False
     return True
 
 
-def send_list_storage_command(dev, path: str) -> Optional[list]:
+def _write_file_chunks(dev, local_path: Path, size: int) -> bool:
+    """39: [8..11] bytes to receive, [12..15] bytes to write, [16] = 1 on the last chunk (closes the file)."""
+    sent = 0
+    with open(local_path, "rb") as fh:
+        while True:
+            chunk = fh.read(UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                return True
+            sent += len(chunk)
+            packet = build_command_packet_header(39)
+            packet[8:12] = len(chunk).to_bytes(4, "big")
+            packet[12:16] = len(chunk).to_bytes(4, "big")
+            packet[16] = 1 if sent >= size else 0
+            if not _ok(write_to_device(dev, encrypt_command_packet(packet) + chunk), 39):
+                logger.error("Panel did not confirm the chunk ending at byte %d (39).", sent)
+                return False
+
+
+def send_list_storage_command(dev, path: str, timeout: float = 10.0) -> Optional[list]:
     """File names in a directory on the SD card (99), or None if the panel did not answer.
 
-    The same request is repeated up to 20 times: the panel answers with empty (all-NUL) replies
-    until the listing is ready, then "result:dir:file:<name>/<name>/..." (NUL padded).
+    The same request is repeated: the panel answers empty (all-NUL) replies until the listing is
+    ready (the 9th reply on firmware 0008), then "result:dir:file:<name>/<name>/..." (NUL padded).
     """
-    logger.info("Listing storage for path: %s", path)
-
-    path_bytes = path.encode("ascii")
-    packet = build_command_packet_header(99)
-    packet[8:12] = len(path_bytes).to_bytes(4, "big")
-    packet[16 : 16 + len(path_bytes)] = path_bytes
-
+    logger.info("Listing %s", path)
+    packet = encrypt_command_packet(_path_packet(99, path))
     received = bytearray()
-    for i in range(20):
-        response = write_to_device(dev, encrypt_command_packet(packet))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = write_to_device(dev, packet)
         if not response:
-            if i > 0:
-                logger.warning("No response in chunk %d", i)
             break
         if not any(response):
             if received:
-                break  # data done; the rest is NUL padding
-            continue  # the panel answers empty until the listing is ready (9th reply on firmware 0008)
+                break  # done; the rest is NUL padding
+            continue
         received += response
     else:
-        logger.warning("Listing may be truncated (20 replies, all with data)")
+        if received:
+            logger.warning("Listing may be truncated (still receiving data after %.0f s)", timeout)
 
     if not received:
-        logger.error("No data received.")
+        logger.error("No listing received from the panel.")
         return None
-
     text = received.replace(b"\0", b"").decode("utf-8", errors="ignore")
     if "file:" not in text:
-        logger.info("No files found or format unexpected: %r", text[:80])
         return []
-    names = text.split("file:", 1)[1].split("/")
-    return [n.strip() for n in names if n.strip()]
+    return [n.strip() for n in text.split("file:", 1)[1].split("/") if n.strip()]
 
 
 def send_refresh_storage_command(dev) -> Optional[dict]:
     """SD card size in KB (100): total, used, free; None if the panel did not answer."""
-    logger.info("Refreshing storage information...")
-    response = write_to_device(dev, encrypt_command_packet(build_command_packet_header(100)))
-
-    if not response or len(response) < 20:
-        logger.error("Invalid or incomplete response from device")
+    response = _query(dev, 100)
+    if response is None:
+        logger.error("Panel did not answer the storage query (100)")
         return None
-
-    total, used, free = (int.from_bytes(response[o : o + 4], byteorder="little") for o in (8, 12, 16))
-    logger.info("  Card Total: %s  Used: %s  Free: %s", format_bytes(total), format_bytes(used), format_bytes(free))
+    total, used, free = (int.from_bytes(response[o : o + 4], "little") for o in (8, 12, 16))
+    logger.info("Card total %s, used %s, free %s", format_bytes(total), format_bytes(used), format_bytes(free))
     return {"total_kb": total, "used_kb": used, "free_kb": free}
 
 
-def _query(dev, command_id: int) -> Optional[bytes]:
-    response = write_to_device(dev, encrypt_command_packet(build_command_packet_header(command_id)))
-    if response is None or len(response) < 24 or response[0] != command_id:
-        return None
-    return bytes(response)
+# ---------------------------------------------------------------- status queries
+
+
+ORIENTATIONS = ("portrait-0", "landscape-90", "portrait-180", "landscape-270")
 
 
 def read_device_info(dev) -> Optional[dict]:
@@ -286,17 +356,15 @@ def read_device_info(dev) -> Optional[dict]:
 
     Returns None if the panel does not answer the version query.
     """
-    version = _query(dev, 10)
-    if version is None:
+    reply = _query(dev, 10)
+    firmware, version = _version_from_reply(reply)
+    if firmware is None:
         logger.error("Panel did not answer the version query (10)")
         return None
-    firmware = version[8:40].split(b"\0", 1)[0].decode("utf-8", errors="replace")
+    _remember_version(dev, reply)
     info: dict = {"firmware": firmware}
-    last = firmware.rsplit("_", 1)[-1]
-    if last.isdigit():
-        info["firmware_version"] = int(last)
-    _FIRMWARE_CACHE[id(dev)] = info.get("firmware_version")
-
+    if version is not None:
+        info["firmware_version"] = version
     storage = _query(dev, 100)
     if storage is not None:
         total, used, free = (int.from_bytes(storage[o : o + 4], "little") for o in (8, 12, 16))
@@ -314,51 +382,20 @@ def read_device_info(dev) -> Optional[dict]:
     return info
 
 
-ORIENTATIONS = ("portrait-0", "landscape-90", "portrait-180", "landscape-270")
-
-
-def set_rotation(dev, rotation: int):
-    """13: set the panel rotation; the panel saves it. 0 or 2 (180°) on the 8.8"."""
-    packet = build_command_packet_header(13)
-    packet[8] = rotation
-    return write_to_device(dev, encrypt_command_packet(packet))
-
-
-def _path_packet(command_id: int, device_path: str) -> bytearray:
-    path_bytes = device_path.encode("ascii")
-    packet = build_command_packet_header(command_id)
-    packet[8:12] = len(path_bytes).to_bytes(4, "big")
-    packet[16 : 16 + len(path_bytes)] = path_bytes
-    return packet
-
-
-def file_size(dev, filename: str) -> Optional[int]:
-    """98: size in bytes of a stored .png / .h264 (0 if it does not exist)."""
-    device_path = device_path_for(filename)
-    if device_path is None:
-        return None
-    response = write_to_device(dev, encrypt_command_packet(_path_packet(98, device_path)))
-    if response is None or len(response) < 12:
-        logger.error("Panel did not answer the file size query (98)")
-        return None
-    return int.from_bytes(response[8:12], "little")
-
-
 def read_voltage(dev) -> Optional[int]:
-    """50: supply voltage in mV (0 on firmware that does not report it)."""
+    """50: supply voltage in mV."""
     response = _query(dev, 50)
     return None if response is None else int.from_bytes(response[8:12], "big")
 
 
 def read_orientation(dev) -> Optional[dict]:
-    """60: orientation sensor; None when the firmware has no sensor support (it answers zeros).
+    """60: orientation sensor; None when the firmware has no sensor (it answers zeros).
 
-    Like the vendor app's first probe, a reading of 0 (portrait-0) is treated as "no sensor".
+    Like the vendor app's first probe, a reading of 0 (portrait-0) counts as "no sensor".
     """
-    response = write_to_device(dev, encrypt_command_packet(build_command_packet_header(60)), 250)
-    if response is None or len(response) < 10 or response[0] != 60 or response[1] != 200:
+    response = _accepted(_command(dev, 60, timeout=250), 60, min_len=10)
+    if response is None:
         return None
-    # Vendor app (first probe): [9] must be non-zero; firmware without a sensor answers zeros.
     if response[8] > 3 or response[9] > 3 or response[9] == 0:
         return None
     return {"sensor": response[8], "orientation": response[9], "name": ORIENTATIONS[response[9]]}
@@ -371,9 +408,9 @@ def read_block_size(dev) -> Optional[int]:
 
 
 def set_clock(dev, when, mode: int = 0):
-    """51: set the panel clock: [8..9] year (big-endian), month, day, hour, minute, second, [15] mode 0/1/2.
+    """51: set the panel clock: [8..9] year (big-endian), month, day, hour, minute, second, [15] mode.
 
-    The vendor app sends it only to the 4.6" model; the 8.8" firmware acknowledges it.
+    The vendor app sends it only to the 4.6" model, with mode 0, 1 or 2 (meaning not decoded).
     """
     packet = build_command_packet_header(51)
     packet[8:10] = when.year.to_bytes(2, "big")
@@ -391,12 +428,12 @@ def set_run_state(dev, running: bool):
 
 def power_off(dev):
     """12: halt the panel (the vendor app sends it on exit). It stays off until power is cycled."""
-    return write_to_device(dev, encrypt_command_packet(build_command_packet_header(12)))
+    return _command(dev, 12)
 
 
 def send_save_settings_command(
     dev,
-    brightness: int = 0,
+    brightness: int = 100,
     startup: int = 0,
     reserved: int = 0,
     rotation: int = 0,
@@ -404,70 +441,102 @@ def send_save_settings_command(
     offline: int = 0,
     clock_direction: int = 0,
 ):
-    logger.info("Saving device settings...")
-    logger.info("  Brightness:     %d", brightness)
-    logger.info("  Startup Mode:   %d", startup)
-    logger.info("  Reserved:       %d", reserved)
-    logger.info("  Rotation:       %d", rotation)
-    logger.info("  Sleep Timeout:  %d", sleep)
-    logger.info("  Offline Mode:   %d", offline)
-    logger.info("  Clock Direction:%d", clock_direction)
+    """125: save all settings at once (every field is written; there is no read-back).
 
-    cmd_packet = build_command_packet_header(125)
-    cmd_packet[8] = brightness
-    cmd_packet[9] = startup
-    cmd_packet[10] = reserved
-    cmd_packet[11] = rotation
-    cmd_packet[12] = sleep
-    cmd_packet[13] = offline
-    cmd_packet[14] = clock_direction  # the vendor app adds this; firmware 0015 stores only [8..13]
+    [8] brightness, [9] startup mode, [10] 0, [11] rotation, [12] sleep, [13] offline mode,
+    [14] offline clock direction (sent by the vendor app; firmware 0015 stores only [8..13]).
+    """
+    logger.info(
+        "Saving settings: brightness=%d startup=%d rotation=%d sleep=%d offline=%d clock_direction=%d",
+        brightness, startup, rotation, sleep, offline, clock_direction,
+    )
+    packet = build_command_packet_header(125)
+    packet[8:15] = bytes([brightness, startup, reserved, rotation, sleep, offline, clock_direction])
+    return write_to_device(dev, encrypt_command_packet(packet))
 
-    return write_to_device(dev, encrypt_command_packet(cmd_packet))
+
+# ---------------------------------------------------------------- playback
 
 
 def stop_play(dev) -> bool:
-    logger.info("Stopping playback (phase 1)")
-    first = write_to_device(dev, encrypt_command_packet(build_command_packet_header(111)))
-
-    logger.info("Stopping playback (phase 2)")
-    second = write_to_device(dev, encrypt_command_packet(build_command_packet_header(114)))
-
-    return first is not None and second is not None
-
-
-def send_image(
-    dev,
-    image_path,
-    max_chunk_bytes: int = 524288,
-    fmt: str = "png",
-    quality: int = 90,
-    max_bytes: int = MAX_IMAGE_BYTES,
-) -> bool:
-    """Show an image now.
-
-    fmt "png": one PNG (102), split into layers if it is over max_chunk_bytes.
-    fmt "jpeg": one JPEG (101), quality lowered until it fits max_bytes.
-    fmt "auto": PNG if it fits one push, otherwise JPEG.
-    """
-    try:
-        with Image.open(image_path) as img:
-            img.load()
-            if img.size != (480, 1920):
-                logger.warning("Image resolution is %dx%d, not 480x1920 (device screen resolution).", *img.size)
-            if fmt == "png":
-                return _send_png_layers(dev, img.convert("RGBA"), max_chunk_bytes)
-            if fmt == "auto":
-                png = _encode_png(img.convert("RGBA"))
-                if len(png) <= min(max_chunk_bytes, max_bytes):
-                    return _send_png_bytes(dev, png) is not None
-            if fmt in ("auto", "jpeg"):
-                jpeg = encode_jpeg_under(img, max_bytes, quality)
-                return send_jpeg_bytes(dev, jpeg) is not None
-            logger.error("Unknown image format: %s", fmt)
-            return False
-    except Exception as exc:
-        logger.error("Error sending image: %s", exc)
+    """Stop stored playback like the vendor app: 111, then poll 112 until it reports stopped."""
+    logger.info("Stopping playback")
+    if not _ok(_command(dev, 111), 111):
         return False
+    for _ in range(10):
+        response = _command(dev, 112)
+        if response is not None and len(response) > 8 and response[8] == 0:
+            return True
+        time.sleep(0.1)
+    logger.error("Panel still reports playback after stop (112)")
+    return False
+
+
+def play_stored_asset(dev, filename: str, brightness: Optional[int] = None) -> bool:
+    """Play a stored .h264 (110) or show a stored .png (113) with the vendor app's sequence:
+    video: 98 (size > 0), 111, 112 until stopped, 102 (blank), 110;
+    image: 111, 112 until stopped, 102 (blank), 113.
+    brightness (14, before the blank) is the CLI's own option. Firmware may not confirm 113
+    (FIRMWARE_FEATURES); only then is the firmware version asked for (10).
+    """
+    device_path = device_path_for(filename)
+    if device_path is None:
+        return False
+    if device_path.endswith(".h264"):
+        size = _remote_size(dev, device_path)
+        if not size:
+            logger.error("%s is not on the panel (or is empty)", device_path)
+            return False
+    if not stop_play(dev):
+        return False
+    if brightness is not None:
+        send_brightness_command(dev, brightness)
+    clear_image(dev)
+    logger.info("Play: %s", device_path)
+    if device_path.endswith(".h264"):
+        # 110: the panel answers [1] = OK ([8] stays 0, unlike what the vendor app checks).
+        if not _ok(write_to_device(dev, encrypt_command_packet(_path_packet(110, device_path))), 110):
+            logger.error("Panel did not confirm playing %s (110)", device_path)
+            return False
+        return True
+    response = write_to_device(dev, encrypt_command_packet(_path_packet(113, device_path)))
+    if _ok(response, 113):
+        return True
+    if response is None and not supports(dev, "stored_image_reply"):
+        logger.warning("Firmware %s does not always confirm showing a stored image; check the screen.", firmware_version(dev))
+        return True
+    logger.error("Panel did not confirm showing %s (113)", device_path)
+    return False
+
+
+# ---------------------------------------------------------------- images
+
+
+def _encode_png(image: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def _send_png_bytes(dev, png: bytes, part: Optional[str] = None):
+    """102: show a PNG now; [8..11] length (big-endian), data after the packet."""
+    packet = build_command_packet_header(102)
+    packet[8:12] = len(png).to_bytes(4, "big")
+    logger.info("→ Transmitting [%s] - %d bytes", part or "image", len(png))
+    return write_to_device(dev, encrypt_command_packet(packet) + png)
+
+
+def send_jpeg_bytes(dev, jpeg: bytes):
+    """101: show a JPEG now; same layout as 102."""
+    packet = build_command_packet_header(101)
+    packet[8:12] = len(jpeg).to_bytes(4, "big")
+    logger.info("→ Transmitting JPEG - %d bytes", len(jpeg))
+    return write_to_device(dev, encrypt_command_packet(packet) + jpeg)
+
+
+def clear_image(dev):
+    """Push a transparent full-screen PNG (102), as the vendor app does before playing."""
+    return _send_png_bytes(dev, _BLANK_PNG, part="blank")
 
 
 def encode_jpeg_under(image: Image.Image, max_bytes: int, quality: int = 90) -> bytes:
@@ -483,459 +552,171 @@ def encode_jpeg_under(image: Image.Image, max_bytes: int, quality: int = 90) -> 
     raise RuntimeError(f"Cannot fit the image as a JPEG under {max_bytes} bytes")
 
 
-def send_jpeg_bytes(dev, jpeg_data: bytes):
-    """Show a JPEG now (101): [8..11] length, data after the header."""
-    cmd_packet = build_command_packet_header(101)
-    cmd_packet[8:12] = len(jpeg_data).to_bytes(4, "big")
-    logger.info("→ Transmitting JPEG - %d bytes", len(jpeg_data))
-    return write_to_device(dev, encrypt_command_packet(cmd_packet) + jpeg_data)
+def send_image(
+    dev,
+    image_path,
+    max_chunk_bytes: int = 524288,
+    fmt: str = "png",
+    quality: int = 90,
+    max_bytes: int = MAX_IMAGE_BYTES,
+) -> bool:
+    """Show an image now.
+
+    fmt "png": one PNG (102), split into layers if it is over max_chunk_bytes (a workaround for the
+        panel's size limit, not something the vendor app does).
+    fmt "jpeg": one JPEG (101), quality lowered until it fits max_bytes.
+    fmt "auto": PNG if it fits one push, otherwise JPEG.
+    """
+    with Image.open(image_path) as img:
+        img.load()
+        if img.size != (480, 1920):
+            logger.warning("Image is %dx%d, not 480x1920 (the screen).", *img.size)
+        if fmt == "png":
+            return _send_png_layers(dev, img.convert("RGBA"), max_chunk_bytes)
+        if fmt == "auto":
+            png = _encode_png(img.convert("RGBA"))
+            if len(png) <= min(max_chunk_bytes, max_bytes):
+                return _send_png_bytes(dev, png) is not None
+        if fmt in ("auto", "jpeg"):
+            return send_jpeg_bytes(dev, encode_jpeg_under(img, max_bytes, quality)) is not None
+        raise ValueError(f"Unknown image format: {fmt}")
 
 
 def _send_png_layers(dev, img, max_chunk_bytes: int) -> bool:
+    """Split a large PNG into horizontal bands sent bottom-up, each on a canvas from the top of the
+    screen to the band's bottom edge, so later (higher) bands do not hide earlier ones."""
     width, height = img.size
-    total_size = len(_encode_png(img))
-    num_layers = math.ceil(total_size / max_chunk_bytes)
-    logger.info("Image size: %d bytes → split into %d layers", total_size, num_layers)
-
-    h = height // num_layers
+    layers = max(1, math.ceil(len(_encode_png(img)) / max_chunk_bytes))
+    logger.info("Sending the image in %d layer(s)", layers)
+    edges = [height * i // layers for i in range(layers + 1)]  # band k covers edges[k]..edges[k+1]
     results = []
-    for i in range(num_layers):
-        y_start = max(0, height - (i + 1) * h)
-        visible_part = img.crop((0, y_start, width, height - h * i))
-        canvas_height = height - i * h
-        layer_img = Image.new("RGBA", (width, canvas_height), (0, 0, 0, 0))
-        layer_img.paste(visible_part, (0, y_start))
-        label = f"layer_{i + 1} ({width}x{canvas_height}) shows Y={y_start}-{height - h * i}"
-        logger.info("Sending %s...", label)
-        results.append(_send_png_bytes(dev, _encode_png(layer_img), part=label))
+    for k in reversed(range(layers)):
+        top, bottom = edges[k], edges[k + 1]
+        canvas = Image.new("RGBA", (width, bottom), (0, 0, 0, 0))
+        canvas.paste(img.crop((0, top, width, bottom)), (0, top))
+        results.append(_send_png_bytes(dev, _encode_png(canvas), part=f"rows {top}-{bottom}"))
     return all(r is not None for r in results)
 
 
-def clear_image(dev):
-    img_data = bytearray(
-        [
-            0x89,
-            0x50,
-            0x4E,
-            0x47,
-            0x0D,
-            0x0A,
-            0x1A,
-            0x0A,
-            0x00,
-            0x00,
-            0x00,
-            0x0D,
-            0x49,
-            0x48,
-            0x44,
-            0x52,
-            0x00,
-            0x00,
-            0x01,
-            0xE0,
-            0x00,
-            0x00,
-            0x07,
-            0x80,
-            0x08,
-            0x06,
-            0x00,
-            0x00,
-            0x00,
-            0x16,
-            0xF0,
-            0x84,
-            0xF5,
-            0x00,
-            0x00,
-            0x00,
-            0x01,
-            0x73,
-            0x52,
-            0x47,
-            0x42,
-            0x00,
-            0xAE,
-            0xCE,
-            0x1C,
-            0xE9,
-            0x00,
-            0x00,
-            0x00,
-            0x04,
-            0x67,
-            0x41,
-            0x4D,
-            0x41,
-            0x00,
-            0x00,
-            0xB1,
-            0x8F,
-            0x0B,
-            0xFC,
-            0x61,
-            0x05,
-            0x00,
-            0x00,
-            0x00,
-            0x09,
-            0x70,
-            0x48,
-            0x59,
-            0x73,
-            0x00,
-            0x00,
-            0x0E,
-            0xC3,
-            0x00,
-            0x00,
-            0x0E,
-            0xC3,
-            0x01,
-            0xC7,
-            0x6F,
-            0xA8,
-            0x64,
-            0x00,
-            0x00,
-            0x0E,
-            0x0C,
-            0x49,
-            0x44,
-            0x41,
-            0x54,
-            0x78,
-            0x5E,
-            0xED,
-            0xC1,
-            0x01,
-            0x0D,
-            0x00,
-            0x00,
-            0x00,
-            0xC2,
-            0xA0,
-            0xF7,
-            0x4F,
-            0x6D,
-            0x0F,
-            0x07,
-            0x14,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-        ]
-        + [0x00] * 3568
-        + [
-            0x00,
-            0xF0,
-            0x66,
-            0x4A,
-            0xC8,
-            0x00,
-            0x01,
-            0x11,
-            0x9D,
-            0x82,
-            0x0A,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x49,
-            0x45,
-            0x4E,
-            0x44,
-            0xAE,
-            0x42,
-            0x60,
-            0x82,
-        ]
-    )
-    img_size = len(img_data)
-    logger.info("Clearing panel image - %d bytes", img_size)
+# ---------------------------------------------------------------- video
 
-    cmd_packet = build_command_packet_header(102)
-    cmd_packet[8] = (img_size >> 24) & 0xFF
-    cmd_packet[9] = (img_size >> 16) & 0xFF
-    cmd_packet[10] = (img_size >> 8) & 0xFF
-    cmd_packet[11] = img_size & 0xFF
 
-    full_payload = encrypt_command_packet(cmd_packet) + img_data
-    return write_to_device(dev, full_payload)
+def extract_h264_from_mp4(mp4_path: str) -> Path:
+    """Copy the H.264 stream of an MP4 into <name>.mp4.h264 (Annex B), reusing an existing one."""
+    input_path = Path(mp4_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    output_path = input_path.with_name(input_path.name + ".h264")
+    if output_path.exists():
+        logger.info("%s already exists; using it.", output_path.name)
+        return output_path
+    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-an", "-f", "h264", str(output_path)]
+    logger.info("Extracting H.264 from %s...", input_path.name)
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return output_path
+
+
+def video_frame_rate(mp4_path: str) -> Optional[int]:
+    """Frame rate of the first video stream (ffprobe), rounded; None if it cannot be read."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+             "-of", "json", str(mp4_path)],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        stream = json.loads(out)["streams"][0]
+        for key in ("avg_frame_rate", "r_frame_rate"):
+            num, _, den = stream.get(key, "0/0").partition("/")
+            if den and float(den) and float(num):
+                return round(float(num) / float(den))
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError, IndexError):
+        pass
+    return None
 
 
 def wait_for_stream(dev, max_queued: int, timeout: float = 10.0) -> bool:
-    """Poll the stream status (122) until the device reports at most max_queued buffered chunks.
+    """Poll the stream status (122) until the panel reports at most max_queued buffered chunks.
 
     Returns False if it is still above that after `timeout` seconds (or stops answering).
     """
     deadline = time.monotonic() + timeout
     while True:
         time.sleep(0.05)
-        response = write_to_device(dev, encrypt_command_packet(build_command_packet_header(122)))
+        response = _command(dev, 122)
         if response is None or len(response) < 9:
-            logger.error("Device did not report its stream status")
+            logger.error("Panel did not report its stream status (122)")
             return False
         if response[8] <= max_queued:
             return True
         if time.monotonic() >= deadline:
-            logger.error("Device still has %d chunks queued after %.1f s", response[8], timeout)
+            logger.error("Panel still has %d chunks queued after %.1f s", response[8], timeout)
             return False
 
 
-def extract_h264_from_mp4(mp4_path: str) -> Path:
-    input_path = Path(mp4_path)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-
-    output_path = input_path.with_name(input_path.name + ".h264")
-
-    if output_path.exists():
-        logger.info("%s already exists. Skipping extraction.", output_path.name)
-        return output_path
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-c:v",
-        "copy",
-        "-bsf:v",
-        "h264_mp4toannexb",
-        "-an",
-        "-f",
-        "h264",
-        str(output_path),
-    ]
-
-    logger.info("Extracting H.264 from %s...", input_path.name)
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        logger.info("Done. Saved as %s", output_path.name)
-        return output_path
-    except subprocess.CalledProcessError as exc:
-        logger.error("FFmpeg error: %s\nOutput: %s", exc, exc.stderr)
-        raise
-
-
 def send_video(
-    dev, video_path, loop: bool = False, brightness: Optional[int] = None, rotation: Optional[int] = None
+    dev,
+    video_path,
+    loop: bool = False,
+    brightness: Optional[int] = None,
+    rotation: Optional[int] = None,
+    frame_rate: Optional[int] = None,
 ) -> bool:
-    try:
-        output_path = extract_h264_from_mp4(video_path)
+    """Stream an MP4's H.264 to the panel (121 chunks, flow control with 122, 123 to stop).
 
-        write_to_device(dev, encrypt_command_packet(build_command_packet_header(111)))
-        write_to_device(dev, encrypt_command_packet(build_command_packet_header(112)))
-        if rotation is not None:
-            # 13 sets the rotation and the panel saves it, so only send it when asked.
-            rotate = build_command_packet_header(13)
-            rotate[8] = rotation
-            write_to_device(dev, encrypt_command_packet(rotate))
+    The frame rate (15) is the video's own, like the vendor app, unless frame_rate is given.
+    With loop=True, Ctrl-C ends the stream normally; otherwise it is re-raised after stopping.
+    """
+    h264 = extract_h264_from_mp4(video_path)
+    if frame_rate is None:
+        frame_rate = video_frame_rate(video_path)
+        if frame_rate is None:
+            logger.warning("Could not read the frame rate of %s; using 25", video_path)
+            frame_rate = 25
+    frame_rate = max(1, min(60, frame_rate))
 
-        if brightness is not None:
-            send_brightness_command(dev, brightness)
-        clear_image(dev)
-        send_frame_rate_command(dev, 25)
-
-        logger.info("Streaming video data...")
-
-        try:
-            while True:
-                file_size_bytes = Path(output_path).stat().st_size
-                with open(output_path, "rb") as fh:
-                    chunk_count = 0
-                    while True:
-                        data = fh.read(STREAM_CHUNK_BYTES)
-                        chunk_size = len(data)
-                        if not data:
-                            break
-
-                        chunk_count += 1
-                        if chunk_count % 10 == 0:
-                            logger.info("Sending chunk #%d (%d bytes)", chunk_count, chunk_size)
-
-                        cmd_packet = build_command_packet_header(121)
-                        cmd_packet[8:12] = chunk_size.to_bytes(4, "big")
-                        cmd_packet[12] = 1 if fh.tell() >= file_size_bytes else 0  # last chunk, as the vendor app
-
-                        full_payload = encrypt_command_packet(cmd_packet) + data
-                        response = write_to_device(dev, full_payload)
-                        time.sleep(0.03)
-
-                        # reply[8] = chunks queued on the device; like the vendor app, wait while it is over 3
-                        if response is None or len(response) < 9 or response[8] > 3:
-                            if not wait_for_stream(dev, 2):
-                                return False
-
-                    logger.info("Video sent successfully (%d chunks)", chunk_count)
-
-                if not loop:
-                    break
-                logger.info("Looping video...")
-
-        except KeyboardInterrupt:
-            logger.info("\nLoop interrupted by user. Sending reset...")
-
-        write_to_device(dev, encrypt_command_packet(build_command_packet_header(123)))
-        return True
-
-    except Exception as exc:
-        logger.error("Error sending video: %s", exc)
-        return False
-
-
-def play_stored_asset(dev, filename: str, brightness: Optional[int] = None) -> bool:
-    if device_path_for(filename) is None:
-        return False
-    ext = Path(filename).suffix.lower()
-
-    delay_sync(dev)
-    stop_play(dev)
+    _command(dev, 111)
+    _command(dev, 112)
+    if rotation is not None:
+        set_rotation(dev, rotation)  # the panel saves it, so only when asked
     if brightness is not None:
         send_brightness_command(dev, brightness)
-
-    cmd_packet = build_command_packet_header(111)
-    write_to_device(dev, encrypt_command_packet(cmd_packet))
-    cmd_packet = build_command_packet_header(112)
-    write_to_device(dev, encrypt_command_packet(cmd_packet))
     clear_image(dev)
+    send_frame_rate_command(dev, frame_rate)
 
-    if ext == ".h264":
-        return play_file2(dev, filename)
-    if ext == ".png":
-        return play_file3(dev, filename)
-
-    logger.error("Error: Unsupported file type. Only .png and .h264 are allowed.")
-    return False
-
-
-def _encode_png(image: Image.Image) -> bytes:
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
-    return buffer.getvalue()
-
-
-def _send_png_bytes(dev, img_data, part: Optional[str] = None):
-    img_size = len(img_data)
-    cmd_packet = build_command_packet_header(102)
-    cmd_packet[8] = (img_size >> 24) & 0xFF
-    cmd_packet[9] = (img_size >> 16) & 0xFF
-    cmd_packet[10] = (img_size >> 8) & 0xFF
-    cmd_packet[11] = img_size & 0xFF
-    logger.info("→ Transmitting [%s] - %d bytes", part or "image", img_size)
-    full_payload = encrypt_command_packet(cmd_packet) + img_data
-    return write_to_device(dev, full_payload)
-
-
-def _open_file_command(dev, path: str):
-    logger.info("Opening remote file: %s", path)
-
-    path_bytes = path.encode("ascii")
-    length = len(path_bytes)
-
-    packet = build_command_packet_header(38)
-
-    packet[8] = (length >> 24) & 0xFF
-    packet[9] = (length >> 16) & 0xFF
-    packet[10] = (length >> 8) & 0xFF
-    packet[11] = length & 0xFF
-    packet[12:16] = b"\x00\x00\x00\x00"
-    packet[16 : 16 + length] = path_bytes
-
-    return write_to_device(dev, encrypt_command_packet(packet))
-
-
-def _write_file_command(dev, file_path: str) -> bool:
-    logger.info("Writing remote file from: %s", file_path)
-
+    size = h264.stat().st_size
+    ok = True
     try:
-        total = Path(file_path).stat().st_size
-        with open(file_path, "rb") as fh:
-            chunk_index = 0
-            sent = 0
-            while True:
-                data_chunk = fh.read(UPLOAD_CHUNK_BYTES)
-                if not data_chunk:
-                    break
-
-                chunk_size = len(data_chunk)
-                chunk_index += 1
-                sent += chunk_size
-                logger.debug("Chunk %d size: %d bytes", chunk_index, chunk_size)
-
-                # [8..11] bytes to receive, [12..15] bytes to write to the file, [16] = 1 closes it.
-                cmd_packet = build_command_packet_header(39)
-                cmd_packet[8:12] = chunk_size.to_bytes(4, "big")
-                cmd_packet[12:16] = chunk_size.to_bytes(4, "big")
-                cmd_packet[16] = 1 if sent >= total else 0
-
-                response = write_to_device(dev, encrypt_command_packet(cmd_packet) + data_chunk)
-                if response is None:
-                    logger.error("Write command failed at chunk %d", chunk_index)
-                    return False
-
-        logger.info("File write completed successfully (%d chunks).", chunk_index)
-        return True
-    except FileNotFoundError:
-        logger.error("File not found: %s", file_path)
-        return False
-    except Exception as exc:
-        logger.error("Error writing file: %s", exc)
-        return False
+        while ok:
+            with open(h264, "rb") as fh:
+                chunks = 0
+                while True:
+                    data = fh.read(STREAM_CHUNK_BYTES)
+                    if not data:
+                        break
+                    chunks += 1
+                    packet = build_command_packet_header(121)
+                    packet[8:12] = len(data).to_bytes(4, "big")
+                    packet[12] = 1 if fh.tell() >= size else 0  # last chunk, as the vendor app
+                    response = write_to_device(dev, encrypt_command_packet(packet) + data)
+                    time.sleep(0.03)
+                    # reply[8] = chunks queued on the panel; like the vendor app, wait while it is over 3
+                    if response is None or len(response) < 9 or response[8] > 3:
+                        if not wait_for_stream(dev, 2):
+                            ok = False
+                            break
+                logger.info("Sent %d chunks", chunks)
+            if not loop:
+                break
+    except KeyboardInterrupt:
+        _stop_stream(dev)
+        if loop:
+            return True
+        raise
+    _stop_stream(dev)
+    return ok
 
 
-def _delete_command(dev, file_path: str):
-    logger.info("Deleting remote file: %s", file_path)
-
-    path_bytes = file_path.encode("ascii")
-    length = len(path_bytes)
-
-    packet = build_command_packet_header(42)
-    packet[8] = (length >> 24) & 0xFF
-    packet[9] = (length >> 16) & 0xFF
-    packet[10] = (length >> 8) & 0xFF
-    packet[11] = length & 0xFF
-    packet[12:16] = b"\x00\x00\x00\x00"
-    packet[16 : 16 + length] = path_bytes
-
-    return write_to_device(dev, encrypt_command_packet(packet))
-
-
-def _play2_command(dev, file_path: str):
-    logger.info("Requesting alternate playback for: %s", file_path)
-
-    path_bytes = file_path.encode("ascii")
-    length = len(path_bytes)
-
-    packet = build_command_packet_header(110)
-
-    packet[8] = (length >> 24) & 0xFF
-    packet[9] = (length >> 16) & 0xFF
-    packet[10] = (length >> 8) & 0xFF
-    packet[11] = length & 0xFF
-    packet[12:16] = b"\x00\x00\x00\x00"
-    packet[16 : 16 + length] = path_bytes
-
-    return write_to_device(dev, encrypt_command_packet(packet))
-
-
-def _play3_command(dev, file_path: str):
-    logger.info("Requesting image playback for: %s", file_path)
-
-    path_bytes = file_path.encode("ascii")
-    length = len(path_bytes)
-
-    packet = build_command_packet_header(113)
-
-    packet[8] = (length >> 24) & 0xFF
-    packet[9] = (length >> 16) & 0xFF
-    packet[10] = (length >> 8) & 0xFF
-    packet[11] = length & 0xFF
-    packet[12:16] = b"\x00\x00\x00\x00"
-    packet[16 : 16 + length] = path_bytes
-
-    return write_to_device(dev, encrypt_command_packet(packet))
+def _stop_stream(dev) -> None:
+    """123 ends the stream; the vendor app follows it with 111."""
+    _command(dev, 123)
+    _command(dev, 111)

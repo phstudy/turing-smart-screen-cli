@@ -7,6 +7,7 @@ import platform
 import struct
 import time
 from functools import partial
+from typing import Any, cast
 
 import usb.core
 import usb.util
@@ -34,11 +35,12 @@ def build_command_packet_header(command_id: int) -> bytearray:
     return packet
 
 
-def encrypt_with_des(key: bytes, data: bytes) -> bytes:
+def encrypt_with_des(key: bytes, data: "bytes | bytearray") -> bytes:
+    """DES-CBC with IV = key and PKCS7 padding, as .NET's DESCryptoServiceProvider in the vendor app
+    (a 500-byte header becomes 504 bytes ending 04 04 04 04)."""
     cipher = DES.new(key, DES.MODE_CBC, key)
-    padded_len = (len(data) + 7) // 8 * 8
-    padded_data = data.ljust(padded_len, b"\x00")
-    return cipher.encrypt(padded_data)
+    pad = 8 - len(data) % 8
+    return cipher.encrypt(bytes(data) + bytes([pad]) * pad)
 
 
 def encrypt_command_packet(data: bytearray) -> bytearray:
@@ -51,7 +53,8 @@ def encrypt_command_packet(data: bytearray) -> bytearray:
 
 
 def find_usb_device():
-    dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+    # find() without find_all returns one Device or None (its stubs also allow a generator).
+    dev = cast(Any, usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID))
     if dev is None:
         raise ValueError("USB device not found")
 
@@ -80,20 +83,29 @@ def read_flush(ep_in, max_attempts: int = 5) -> None:
             break
 
 
+class TransportError(RuntimeError):
+    """A command could not be written to the panel."""
+
+
 def write_to_device(dev, data, timeout: int = 2000):
+    """Write one command (packet plus any data) and return the 512-byte reply.
+
+    Returns None when the panel does not answer within `timeout` ms; raises TransportError when the
+    write itself fails.
+    """
     cfg = dev.get_active_configuration()
     intf = usb.util.find_descriptor(cfg, bInterfaceNumber=0)
     if intf is None:
         raise RuntimeError("USB interface 0 not found")
 
-    ep_out = usb.util.find_descriptor(
+    ep_out: Any = usb.util.find_descriptor(
         intf,
         custom_match=partial(
             _endpoint_matches_direction,
             direction=usb.util.ENDPOINT_OUT,
         ),
     )
-    ep_in = usb.util.find_descriptor(
+    ep_in: Any = usb.util.find_descriptor(
         intf,
         custom_match=partial(
             _endpoint_matches_direction,
@@ -106,13 +118,13 @@ def write_to_device(dev, data, timeout: int = 2000):
     try:
         ep_out.write(data, timeout)
     except usb.core.USBError as exc:
-        logger.error("USB write error: %s", exc)
-        return None
+        # The command never reached the panel: an error, not "no reply" (callers may accept no reply).
+        raise TransportError(f"USB write failed: {exc}") from exc
 
     try:
         response = ep_in.read(512, timeout)
         read_flush(ep_in)
         return bytes(response)
     except usb.core.USBError as exc:
-        logger.error("USB read error: %s", exc)
+        logger.debug("No reply: %s", exc)
         return None
